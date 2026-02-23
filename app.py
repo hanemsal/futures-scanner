@@ -1,97 +1,337 @@
-import requests
-import pandas as pd
-import time
-import schedule
 import os
+import time
+from datetime import datetime, timezone
+from typing import Dict, List, Tuple, Optional
 
-# Telegram function
-def send_telegram(text: str):
-    token = os.getenv("TG_BOT_TOKEN")
-    chat_id = os.getenv("TG_CHAT_ID")
+import requests
 
-    if not token or not chat_id:
-        print("[WARN] Telegram env eksik", flush=True)
-        return
+from notify import send_telegram
+from storage import Storage
 
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
+# ---------- Ayarlar ----------
+INTERVAL_SEC = int(os.getenv("INTERVAL_SEC", "900"))  # 15 dk
+TF = "1h"
+
+EMA_LEN = int(os.getenv("EMA_LEN", "123"))
+RSI_LEN = int(os.getenv("RSI_LEN", "123"))
+
+RSI_THRESHOLD = float(os.getenv("RSI_THRESHOLD", "50"))
+BUFFER_PCT = float(os.getenv("BUFFER_PCT", "0.2"))  # %0.2
+BODY_RATIO_MIN = float(os.getenv("BODY_RATIO_MIN", "0.5"))
+EMA_SLOPE_LOOKBACK = int(os.getenv("EMA_SLOPE_LOOKBACK", "3"))  # 3 mum önce ile kıyas
+
+USE_STORAGE = os.getenv("USE_STORAGE", "1") == "1"
+STORAGE_PATH = os.getenv("STORAGE_PATH", "state.json")
+
+BINANCE_FAPI = "https://fapi.binance.com"
+
+# Telegram limit: 4096 char. Güvende kalalım.
+TG_CHUNK_LIMIT = int(os.getenv("TG_CHUNK_LIMIT", "3500"))
+
+st = Storage(STORAGE_PATH) if USE_STORAGE else None
+
+
+# ---------- Yardımcılar ----------
+def utc_now_str() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def safe_float(x, default=0.0) -> float:
     try:
-        requests.post(url, json={"chat_id": chat_id, "text": text})
-        print("Telegram mesaj gönderildi.", flush=True)
-    except Exception as e:
-        print(f"Telegram hata: {e}", flush=True)
+        return float(x)
+    except Exception:
+        return default
 
 
-BINANCE_FUTURES_24H = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+def fetch_usdt_perp_symbols() -> List[str]:
+    """
+    USDT perpetual, TRADING durumunda olan sözleşmeler.
+    """
+    url = f"{BINANCE_FAPI}/fapi/v1/exchangeInfo"
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    data = r.json()
 
-MIN_VOLUME = 25_000_000
-MIN_CHANGE = 8
-SCORE_THRESHOLD = 20
-TOP_N = 7
-
-
-def fetch_24h_data():
-    response = requests.get(BINANCE_FUTURES_24H)
-    data = response.json()
-    df = pd.DataFrame(data)
-    df = df[df["symbol"].str.endswith("USDT")]
-    df["quoteVolume"] = df["quoteVolume"].astype(float)
-    df["priceChangePercent"] = df["priceChangePercent"].astype(float)
-    return df
-
-
-def calculate_score(row):
-    score = 0
-
-    if row["quoteVolume"] > MIN_VOLUME:
-        score += 15
-
-    if abs(row["priceChangePercent"]) >= MIN_CHANGE:
-        score += 10
-
-    return score
+    out = []
+    for s in data.get("symbols", []):
+        if s.get("quoteAsset") != "USDT":
+            continue
+        if s.get("contractType") != "PERPETUAL":
+            continue
+        if s.get("status") != "TRADING":
+            continue
+        # Binance Futures'ta deliveryDate vs. olanlar elensin
+        sym = s.get("symbol")
+        if sym:
+            out.append(sym)
+    return out
 
 
-def run_scanner():
-    print("Scanner çalışıyor...", flush=True)
+def fetch_klines(symbol: str, interval: str, limit: int = 250) -> List[list]:
+    url = f"{BINANCE_FAPI}/fapi/v1/klines"
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    r = requests.get(url, params=params, timeout=30)
+    r.raise_for_status()
+    return r.json()
 
-    df = fetch_24h_data()
-    df["score"] = df.apply(calculate_score, axis=1)
-    df = df[df["score"] >= SCORE_THRESHOLD]
 
-    if df.empty:
-        print("Uygun coin yok.", flush=True)
-        return
+def ema_series(values: List[float], length: int) -> List[Optional[float]]:
+    """
+    EMA seri. İlk EMA başlangıcını SMA ile yapar.
+    """
+    if len(values) < length:
+        return [None] * len(values)
 
-    top_coins = df.sort_values("score", ascending=False).head(TOP_N)
+    out: List[Optional[float]] = [None] * len(values)
+    alpha = 2.0 / (length + 1.0)
 
-    message_lines = ["📊 FUTURES TOP COINS"]
+    # initial SMA
+    sma = sum(values[:length]) / length
+    out[length - 1] = sma
 
-    for _, row in top_coins.iterrows():
-        direction = "LONG" if row["priceChangePercent"] > 0 else "SHORT"
+    prev = sma
+    for i in range(length, len(values)):
+        prev = alpha * values[i] + (1 - alpha) * prev
+        out[i] = prev
+    return out
 
-        line = (
-            f"{row['symbol']} | {direction} | "
-            f"Score:{int(row['score'])} | "
-            f"Change:{row['priceChangePercent']:.2f}% | "
-            f"Vol:{row['quoteVolume']:.0f}"
+
+def rsi_series(values: List[float], length: int) -> List[Optional[float]]:
+    """
+    Wilder RSI.
+    """
+    if len(values) < length + 1:
+        return [None] * len(values)
+
+    out: List[Optional[float]] = [None] * len(values)
+
+    gains = 0.0
+    losses = 0.0
+    for i in range(1, length + 1):
+        ch = values[i] - values[i - 1]
+        if ch >= 0:
+            gains += ch
+        else:
+            losses += (-ch)
+
+    avg_gain = gains / length
+    avg_loss = losses / length
+
+    def calc_rsi(ag: float, al: float) -> float:
+        if al == 0:
+            return 100.0
+        rs = ag / al
+        return 100.0 - (100.0 / (1.0 + rs))
+
+    out[length] = calc_rsi(avg_gain, avg_loss)
+
+    for i in range(length + 1, len(values)):
+        ch = values[i] - values[i - 1]
+        gain = ch if ch > 0 else 0.0
+        loss = (-ch) if ch < 0 else 0.0
+
+        avg_gain = (avg_gain * (length - 1) + gain) / length
+        avg_loss = (avg_loss * (length - 1) + loss) / length
+        out[i] = calc_rsi(avg_gain, avg_loss)
+
+    return out
+
+
+def body_ratio(open_: float, high: float, low: float, close: float) -> float:
+    rng = max(high - low, 1e-12)
+    body = abs(close - open_)
+    return body / rng
+
+
+def chunk_messages(text: str, limit: int) -> List[str]:
+    if len(text) <= limit:
+        return [text]
+    parts = []
+    buf = ""
+    for line in text.split("\n"):
+        # +1 for newline
+        if len(buf) + len(line) + 1 > limit:
+            parts.append(buf.rstrip())
+            buf = ""
+        buf += line + "\n"
+    if buf.strip():
+        parts.append(buf.rstrip())
+    return parts
+
+
+# ---------- Sinyal Kontrol ----------
+def check_long_signal(symbol: str) -> Tuple[bool, Optional[Dict]]:
+    """
+    1H son kapanan mumda:
+      - fresh breakout: close_last > ema_last AND close_prev <= ema_prev
+      - RSI(123) > 50
+      - buffer: close_last > ema_last * (1 + buffer)
+      - body_ratio >= 0.5
+      - ema slope: ema_last > ema_(lookback)
+    """
+    kl = fetch_klines(symbol, TF, limit=260)
+    if not kl or len(kl) < (EMA_LEN + RSI_LEN + 5):
+        return (False, None)
+
+    # Binance klines format:
+    # [ openTime, open, high, low, close, volume, closeTime, ...]
+    # Son kline genelde "açık" olabilir; sinyal için son kapanan mum: -2
+    last_closed = kl[-2]
+    prev_closed = kl[-3]
+
+    last_close_time = int(last_closed[6])  # ms
+    if USE_STORAGE and st:
+        if last_close_time <= st.get_last_close_time(symbol):
+            return (False, None)  # yeni 1H kapanışı yok
+
+    # close serisi: tüm klines'in close'ları (float)
+    closes = [safe_float(x[4]) for x in kl]
+    opens = [safe_float(x[1]) for x in kl]
+    highs = [safe_float(x[2]) for x in kl]
+    lows  = [safe_float(x[3]) for x in kl]
+
+    # "kapanmış mumlar" listesi: son open olanı çıkar
+    closes_c = closes[:-1]
+    opens_c = opens[:-1]
+    highs_c = highs[:-1]
+    lows_c = lows[:-1]
+
+    # İndeks: last closed candle = -1, prev = -2
+    ema = ema_series(closes_c, EMA_LEN)
+    rsi = rsi_series(closes_c, RSI_LEN)
+
+    if ema[-1] is None or ema[-2] is None:
+        return (False, None)
+    if rsi[-1] is None:
+        return (False, None)
+
+    close_last = closes_c[-1]
+    close_prev = closes_c[-2]
+    ema_last = float(ema[-1])
+    ema_prev = float(ema[-2])
+
+    # 1) fresh breakout
+    fresh_break = (close_last > ema_last) and (close_prev <= ema_prev)
+
+    # 2) RSI
+    rsi_last = float(rsi[-1])
+    rsi_ok = (rsi_last > RSI_THRESHOLD)
+
+    # 3) buffer
+    buffer_mult = 1.0 + (BUFFER_PCT / 100.0)
+    buffer_ok = (close_last > ema_last * buffer_mult)
+
+    # 4) body ratio
+    br = body_ratio(opens_c[-1], highs_c[-1], lows_c[-1], close_last)
+    body_ok = (br >= BODY_RATIO_MIN)
+
+    # 5) EMA slope
+    lb = EMA_SLOPE_LOOKBACK
+    if len(ema) < (lb + 2) or ema[-(lb + 1)] is None:
+        slope_ok = True  # veri yetmezse slope filtresini pas geç
+        ema_lb = None
+    else:
+        ema_lb = float(ema[-(lb + 1)])
+        slope_ok = (ema_last > ema_lb)
+
+    ok = fresh_break and rsi_ok and buffer_ok and body_ok and slope_ok
+
+    info = {
+        "symbol": symbol,
+        "close_time_ms": last_close_time,
+        "close": close_last,
+        "ema123": ema_last,
+        "rsi123": rsi_last,
+        "ema_dist_pct": (close_last / ema_last - 1.0) * 100.0,
+        "body_ratio": br,
+        "ema_slope_ok": slope_ok,
+        "ema_lb": ema_lb,
+        "flags": {
+            "fresh_break": fresh_break,
+            "rsi_ok": rsi_ok,
+            "buffer_ok": buffer_ok,
+            "body_ok": body_ok,
+            "slope_ok": slope_ok,
+        },
+    }
+    return (ok, info)
+
+
+def format_telegram(signals: List[Dict]) -> str:
+    # Çok sinyal gelirse en güçlüleri üstte: EMA üstü % büyük olan
+    signals_sorted = sorted(signals, key=lambda x: x.get("ema_dist_pct", 0.0), reverse=True)
+
+    header = (
+        f"🟢 <b>EMA123 Breakout LONG</b>\n"
+        f"<b>TF:</b> 1H | <b>RSI(123):</b> > {RSI_THRESHOLD}\n"
+        f"<b>Fake Filter:</b> buffer {BUFFER_PCT:.2f}% | body≥{BODY_RATIO_MIN:.2f} | EMA slope(+)\n"
+        f"<b>Uyan Coin:</b> {len(signals_sorted)}\n"
+        f"<i>{utc_now_str()}</i>\n"
+        f"────────────────────"
+    )
+
+    lines = [header]
+    for s in signals_sorted:
+        sym = s["symbol"]
+        rsi = s["rsi123"]
+        dist = s["ema_dist_pct"]
+        br = s["body_ratio"]
+        price = s["close"]
+        lines.append(
+            f"• <b>{sym}</b> | RSI: {rsi:.2f} | EMA üstü: {dist:+.2f}% | BR: {br:.2f} | Close: {price}"
         )
 
-        print(line, flush=True)
-        message_lines.append(line)
-
-    send_telegram("\n".join(message_lines))
+    return "\n".join(lines)
 
 
-def job():
-    run_scanner()
+def main():
+    while True:
+        try:
+            symbols = fetch_usdt_perp_symbols()
 
+            signals: List[Dict] = []
+            updated_symbols: List[Tuple[str, int]] = []
 
-schedule.every(15).minutes.do(job)
+            for sym in symbols:
+                try:
+                    ok, info = check_long_signal(sym)
+                    # Yeni 1H kapanışı varsa (storage ilerlemek için)
+                    if info and "close_time_ms" in info:
+                        updated_symbols.append((sym, int(info["close_time_ms"])))
+
+                    if ok and info:
+                        signals.append(info)
+
+                except requests.HTTPError:
+                    # çok sert fail olmasın diye sessiz geç
+                    continue
+                except Exception:
+                    continue
+
+            # Storage: yeni kapanan mumları işlenmiş olarak işaretle
+            if USE_STORAGE and st:
+                for sym, ct in updated_symbols:
+                    # önemli: sinyal olsun/olmasın, o 1H kapanışını "işledik" sayıyoruz
+                    last = st.get_last_close_time(sym)
+                    if ct > last:
+                        st.set_last_close_time(sym, ct)
+
+            if signals:
+                msg = format_telegram(signals)
+                parts = chunk_messages(msg, TG_CHUNK_LIMIT)
+                for i, part in enumerate(parts, start=1):
+                    if len(parts) > 1:
+                        part = f"<b>({i}/{len(parts)})</b>\n" + part
+                    send_telegram(part)
+            else:
+                # İstersen “sinyal yok” mesajını kapalı tutalım (spam olur). O yüzden hiçbir şey göndermiyoruz.
+                pass
+
+        except Exception as e:
+            print("Main error:", str(e), flush=True)
+
+        time.sleep(INTERVAL_SEC)
+
 
 if __name__ == "__main__":
-    print("Futures Scanner Başladı...", flush=True)
-    run_scanner()
-
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
+    main()
