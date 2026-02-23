@@ -60,7 +60,6 @@ def fetch_usdt_perp_symbols() -> List[str]:
             continue
         if s.get("status") != "TRADING":
             continue
-        # Binance Futures'ta deliveryDate vs. olanlar elensin
         sym = s.get("symbol")
         if sym:
             out.append(sym)
@@ -149,7 +148,6 @@ def chunk_messages(text: str, limit: int) -> List[str]:
     parts = []
     buf = ""
     for line in text.split("\n"):
-        # +1 for newline
         if len(buf) + len(line) + 1 > limit:
             parts.append(buf.rstrip())
             buf = ""
@@ -173,30 +171,29 @@ def check_long_signal(symbol: str) -> Tuple[bool, Optional[Dict]]:
     if not kl or len(kl) < (EMA_LEN + RSI_LEN + 5):
         return (False, None)
 
-    # Binance klines format:
-    # [ openTime, open, high, low, close, volume, closeTime, ...]
     # Son kline genelde "açık" olabilir; sinyal için son kapanan mum: -2
     last_closed = kl[-2]
     prev_closed = kl[-3]
 
     last_close_time = int(last_closed[6])  # ms
+
+    # Yeni 1H kapanışı yoksa sinyal kontrolü yapmayalım
     if USE_STORAGE and st:
         if last_close_time <= st.get_last_close_time(symbol):
-            return (False, None)  # yeni 1H kapanışı yok
+            return (False, None)
 
-    # close serisi: tüm klines'in close'ları (float)
     closes = [safe_float(x[4]) for x in kl]
     opens = [safe_float(x[1]) for x in kl]
     highs = [safe_float(x[2]) for x in kl]
-    lows  = [safe_float(x[3]) for x in kl]
+    lows = [safe_float(x[3]) for x in kl]
 
-    # "kapanmış mumlar" listesi: son open olanı çıkar
+    # "kapanmış mumlar" listesi: son açık olanı çıkar
     closes_c = closes[:-1]
     opens_c = opens[:-1]
     highs_c = highs[:-1]
     lows_c = lows[:-1]
 
-    # İndeks: last closed candle = -1, prev = -2
+    # EMA/RSI
     ema = ema_series(closes_c, EMA_LEN)
     rsi = rsi_series(closes_c, RSI_LEN)
 
@@ -228,7 +225,7 @@ def check_long_signal(symbol: str) -> Tuple[bool, Optional[Dict]]:
     # 5) EMA slope
     lb = EMA_SLOPE_LOOKBACK
     if len(ema) < (lb + 2) or ema[-(lb + 1)] is None:
-        slope_ok = True  # veri yetmezse slope filtresini pas geç
+        slope_ok = True
         ema_lb = None
     else:
         ema_lb = float(ema[-(lb + 1)])
@@ -258,7 +255,6 @@ def check_long_signal(symbol: str) -> Tuple[bool, Optional[Dict]]:
 
 
 def format_telegram(signals: List[Dict]) -> str:
-    # Çok sinyal gelirse en güçlüleri üstte: EMA üstü % büyük olan
     signals_sorted = sorted(signals, key=lambda x: x.get("ema_dist_pct", 0.0), reverse=True)
 
     header = (
@@ -285,7 +281,15 @@ def format_telegram(signals: List[Dict]) -> str:
 
 
 def main():
+    # ---------- DEBUG STARTUP ----------
+    print("Scanner started...", flush=True)
+    try:
+        send_telegram("✅ Futures Scanner başladı. 1H kapanış bekleniyor.")
+    except Exception as e:
+        print("Telegram startup ping failed:", str(e), flush=True)
+
     while True:
+        loop_started = utc_now_str()
         try:
             symbols = fetch_usdt_perp_symbols()
 
@@ -295,6 +299,7 @@ def main():
             for sym in symbols:
                 try:
                     ok, info = check_long_signal(sym)
+
                     # Yeni 1H kapanışı varsa (storage ilerlemek için)
                     if info and "close_time_ms" in info:
                         updated_symbols.append((sym, int(info["close_time_ms"])))
@@ -303,7 +308,6 @@ def main():
                         signals.append(info)
 
                 except requests.HTTPError:
-                    # çok sert fail olmasın diye sessiz geç
                     continue
                 except Exception:
                     continue
@@ -311,7 +315,6 @@ def main():
             # Storage: yeni kapanan mumları işlenmiş olarak işaretle
             if USE_STORAGE and st:
                 for sym, ct in updated_symbols:
-                    # önemli: sinyal olsun/olmasın, o 1H kapanışını "işledik" sayıyoruz
                     last = st.get_last_close_time(sym)
                     if ct > last:
                         st.set_last_close_time(sym, ct)
@@ -323,9 +326,12 @@ def main():
                     if len(parts) > 1:
                         part = f"<b>({i}/{len(parts)})</b>\n" + part
                     send_telegram(part)
-            else:
-                # İstersen “sinyal yok” mesajını kapalı tutalım (spam olur). O yüzden hiçbir şey göndermiyoruz.
-                pass
+
+            # ---------- DEBUG LOOP LOG ----------
+            print(
+                f"[LOOP] scanned={len(symbols)} new1h={len(updated_symbols)} signals={len(signals)} time={loop_started}",
+                flush=True
+            )
 
         except Exception as e:
             print("Main error:", str(e), flush=True)
