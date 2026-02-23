@@ -15,10 +15,19 @@ TF = "1h"
 EMA_LEN = int(os.getenv("EMA_LEN", "123"))
 RSI_LEN = int(os.getenv("RSI_LEN", "123"))
 
-RSI_THRESHOLD = float(os.getenv("RSI_THRESHOLD", "50"))
-BUFFER_PCT = float(os.getenv("BUFFER_PCT", "0.2"))  # %0.2
-BODY_RATIO_MIN = float(os.getenv("BODY_RATIO_MIN", "0.5"))
+# İSTEK: RSI > 51
+RSI_THRESHOLD = float(os.getenv("RSI_THRESHOLD", "51"))
+
+# İSTEK: EMA üstüne mesafe yok (buffer kaldır)
+# İstersen ENV'den tamamen 0 yap: BUFFER_PCT=0
+BUFFER_PCT = float(os.getenv("BUFFER_PCT", "0"))
+
+# Fake breakout filtresi (gövde oranı kalsın dedin)
+BODY_RATIO_MIN = float(os.getenv("BODY_RATIO_MIN", "0.45"))
+
+# EMA eğim filtresi (istersen 0 yapıp kapatabilirsin)
 EMA_SLOPE_LOOKBACK = int(os.getenv("EMA_SLOPE_LOOKBACK", "3"))  # 3 mum önce ile kıyas
+USE_EMA_SLOPE = os.getenv("USE_EMA_SLOPE", "1") == "1"
 
 USE_STORAGE = os.getenv("USE_STORAGE", "1") == "1"
 STORAGE_PATH = os.getenv("STORAGE_PATH", "state.json")
@@ -46,6 +55,7 @@ def safe_float(x, default=0.0) -> float:
 def fetch_usdt_perp_symbols() -> List[str]:
     """
     USDT perpetual, TRADING durumunda olan sözleşmeler.
+    API'de .P yok, örn: POWERUSDT
     """
     url = f"{BINANCE_FAPI}/fapi/v1/exchangeInfo"
     r = requests.get(url, timeout=30)
@@ -66,7 +76,7 @@ def fetch_usdt_perp_symbols() -> List[str]:
     return out
 
 
-def fetch_klines(symbol: str, interval: str, limit: int = 250) -> List[list]:
+def fetch_klines(symbol: str, interval: str, limit: int = 300) -> List[list]:
     url = f"{BINANCE_FAPI}/fapi/v1/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
     r = requests.get(url, params=params, timeout=30)
@@ -75,16 +85,12 @@ def fetch_klines(symbol: str, interval: str, limit: int = 250) -> List[list]:
 
 
 def ema_series(values: List[float], length: int) -> List[Optional[float]]:
-    """
-    EMA seri. İlk EMA başlangıcını SMA ile yapar.
-    """
     if len(values) < length:
         return [None] * len(values)
 
     out: List[Optional[float]] = [None] * len(values)
     alpha = 2.0 / (length + 1.0)
 
-    # initial SMA
     sma = sum(values[:length]) / length
     out[length - 1] = sma
 
@@ -96,9 +102,6 @@ def ema_series(values: List[float], length: int) -> List[Optional[float]]:
 
 
 def rsi_series(values: List[float], length: int) -> List[Optional[float]]:
-    """
-    Wilder RSI.
-    """
     if len(values) < length + 1:
         return [None] * len(values)
 
@@ -160,91 +163,83 @@ def chunk_messages(text: str, limit: int) -> List[str]:
 # ---------- Sinyal Kontrol ----------
 def check_long_signal(symbol: str) -> Tuple[bool, Optional[Dict]]:
     """
-    1H son kapanan mumda:
-      - fresh breakout: close_last > ema_last AND close_prev <= ema_prev
-      - RSI(123) > 50
-      - buffer: close_last > ema_last * (1 + buffer)
-      - body_ratio >= 0.5
-      - ema slope: ema_last > ema_(lookback)
+    1H son KAPANAN mumda:
+      - Gövde kesişimi: open_last <= ema_last AND close_last > ema_last
+        (tercihen yeşil kapanış)
+      - RSI(RSI_LEN) > RSI_THRESHOLD
+      - Buffer yok (BUFFER_PCT default 0)
+      - Body_ratio >= BODY_RATIO_MIN
+      - EMA slope (+) opsiyonel
     """
-    kl = fetch_klines(symbol, TF, limit=260)
-    if not kl or len(kl) < (EMA_LEN + RSI_LEN + 5):
+    kl = fetch_klines(symbol, TF, limit=320)
+    if not kl or len(kl) < (max(EMA_LEN, RSI_LEN) + 10):
         return (False, None)
 
-    # Son kline genelde "açık" olabilir; sinyal için son kapanan mum: -2
+    # Binance klines: son eleman çoğu zaman açık mumdur
+    # KAPANAN son mum = -2
     last_closed = kl[-2]
-    prev_closed = kl[-3]
+    last_close_time = int(last_closed[6])  # ms (close time)
 
-    last_close_time = int(last_closed[6])  # ms
-
-    # Yeni 1H kapanışı yoksa sinyal kontrolü yapmayalım
     if USE_STORAGE and st:
         if last_close_time <= st.get_last_close_time(symbol):
             return (False, None)
 
-    closes = [safe_float(x[4]) for x in kl]
-    opens = [safe_float(x[1]) for x in kl]
-    highs = [safe_float(x[2]) for x in kl]
-    lows = [safe_float(x[3]) for x in kl]
+    opens = [safe_float(x[1]) for x in kl][:-1]   # açık mum çıkar
+    highs = [safe_float(x[2]) for x in kl][:-1]
+    lows = [safe_float(x[3]) for x in kl][:-1]
+    closes = [safe_float(x[4]) for x in kl][:-1]
 
-    # "kapanmış mumlar" listesi: son açık olanı çıkar
-    closes_c = closes[:-1]
-    opens_c = opens[:-1]
-    highs_c = highs[:-1]
-    lows_c = lows[:-1]
+    ema = ema_series(closes, EMA_LEN)
+    rsi = rsi_series(closes, RSI_LEN)
 
-    # EMA/RSI
-    ema = ema_series(closes_c, EMA_LEN)
-    rsi = rsi_series(closes_c, RSI_LEN)
-
-    if ema[-1] is None or ema[-2] is None:
-        return (False, None)
-    if rsi[-1] is None:
+    if ema[-1] is None or rsi[-1] is None:
         return (False, None)
 
-    close_last = closes_c[-1]
-    close_prev = closes_c[-2]
+    open_last = opens[-1]
+    high_last = highs[-1]
+    low_last = lows[-1]
+    close_last = closes[-1]
     ema_last = float(ema[-1])
-    ema_prev = float(ema[-2])
+    rsi_last = float(rsi[-1])
 
-    # 1) fresh breakout
-    fresh_break = (close_last > ema_last) and (close_prev <= ema_prev)
+    # 1) Gövde kesişimi (candle crosses EMA)
+    # İstersen daha sert: open_last < ema_last AND close_last > ema_last AND close_last > open_last
+    candle_cross = (open_last <= ema_last) and (close_last > ema_last) and (close_last > open_last)
 
     # 2) RSI
-    rsi_last = float(rsi[-1])
-    rsi_ok = (rsi_last > RSI_THRESHOLD)
+    rsi_ok = rsi_last > RSI_THRESHOLD
 
-    # 3) buffer
+    # 3) Buffer (kapalı / default 0)
     buffer_mult = 1.0 + (BUFFER_PCT / 100.0)
-    buffer_ok = (close_last > ema_last * buffer_mult)
+    buffer_ok = close_last > ema_last * buffer_mult
 
-    # 4) body ratio
-    br = body_ratio(opens_c[-1], highs_c[-1], lows_c[-1], close_last)
-    body_ok = (br >= BODY_RATIO_MIN)
+    # 4) Body ratio
+    br = body_ratio(open_last, high_last, low_last, close_last)
+    body_ok = br >= BODY_RATIO_MIN
 
-    # 5) EMA slope
-    lb = EMA_SLOPE_LOOKBACK
-    if len(ema) < (lb + 2) or ema[-(lb + 1)] is None:
-        slope_ok = True
-        ema_lb = None
-    else:
-        ema_lb = float(ema[-(lb + 1)])
-        slope_ok = (ema_last > ema_lb)
+    # 5) EMA slope (opsiyonel)
+    slope_ok = True
+    ema_lb = None
+    if USE_EMA_SLOPE and EMA_SLOPE_LOOKBACK > 0:
+        lb = EMA_SLOPE_LOOKBACK
+        if len(ema) >= (lb + 2) and ema[-(lb + 1)] is not None:
+            ema_lb = float(ema[-(lb + 1)])
+            slope_ok = ema_last > ema_lb
 
-    ok = fresh_break and rsi_ok and buffer_ok and body_ok and slope_ok
+    ok = candle_cross and rsi_ok and buffer_ok and body_ok and slope_ok
 
     info = {
         "symbol": symbol,
         "close_time_ms": last_close_time,
+        "open": open_last,
         "close": close_last,
-        "ema123": ema_last,
-        "rsi123": rsi_last,
+        "ema": ema_last,
+        "rsi": rsi_last,
         "ema_dist_pct": (close_last / ema_last - 1.0) * 100.0,
         "body_ratio": br,
-        "ema_slope_ok": slope_ok,
         "ema_lb": ema_lb,
         "flags": {
-            "fresh_break": fresh_break,
+            "candle_cross": candle_cross,
             "rsi_ok": rsi_ok,
             "buffer_ok": buffer_ok,
             "body_ok": body_ok,
@@ -258,9 +253,12 @@ def format_telegram(signals: List[Dict]) -> str:
     signals_sorted = sorted(signals, key=lambda x: x.get("ema_dist_pct", 0.0), reverse=True)
 
     header = (
-        f"🟢 <b>EMA123 Breakout LONG</b>\n"
-        f"<b>TF:</b> 1H | <b>RSI(123):</b> > {RSI_THRESHOLD}\n"
-        f"<b>Fake Filter:</b> buffer {BUFFER_PCT:.2f}% | body≥{BODY_RATIO_MIN:.2f} | EMA slope(+)\n"
+        f"🟢 <b>EMA{EMA_LEN} Breakout LONG</b>\n"
+        f"<b>TF:</b> 1H | <b>RSI({RSI_LEN}):</b> > {RSI_THRESHOLD}\n"
+        f"<b>Koşul:</b> gövde EMA üstü kapanış | body≥{BODY_RATIO_MIN:.2f}"
+        + (f" | slope(+)" if USE_EMA_SLOPE else "")
+        + (f" | buffer {BUFFER_PCT:.2f}%" if BUFFER_PCT > 0 else " | buffer yok")
+        + "\n"
         f"<b>Uyan Coin:</b> {len(signals_sorted)}\n"
         f"<i>{utc_now_str()}</i>\n"
         f"────────────────────"
@@ -268,20 +266,20 @@ def format_telegram(signals: List[Dict]) -> str:
 
     lines = [header]
     for s in signals_sorted:
-        sym = s["symbol"]
-        rsi = s["rsi123"]
+        sym = s["symbol"] + ".P"  # TradingView uyumu için gösterimde .P
+        rsi = s["rsi"]
         dist = s["ema_dist_pct"]
         br = s["body_ratio"]
-        price = s["close"]
+        close = s["close"]
+        ema = s["ema"]
         lines.append(
-            f"• <b>{sym}</b> | RSI: {rsi:.2f} | EMA üstü: {dist:+.2f}% | BR: {br:.2f} | Close: {price}"
+            f"• <b>{sym}</b> | RSI: {rsi:.2f} | Close: {close} | EMA{EMA_LEN}: {ema} | EMA üstü: {dist:+.2f}% | BR: {br:.2f}"
         )
 
     return "\n".join(lines)
 
 
 def main():
-    # ---------- DEBUG STARTUP ----------
     print("Scanner started...", flush=True)
     try:
         send_telegram("✅ Futures Scanner başladı. 1H kapanış bekleniyor.")
@@ -300,7 +298,6 @@ def main():
                 try:
                     ok, info = check_long_signal(sym)
 
-                    # Yeni 1H kapanışı varsa (storage ilerlemek için)
                     if info and "close_time_ms" in info:
                         updated_symbols.append((sym, int(info["close_time_ms"])))
 
@@ -312,7 +309,7 @@ def main():
                 except Exception:
                     continue
 
-            # Storage: yeni kapanan mumları işlenmiş olarak işaretle
+            # Storage update
             if USE_STORAGE and st:
                 for sym, ct in updated_symbols:
                     last = st.get_last_close_time(sym)
@@ -327,7 +324,6 @@ def main():
                         part = f"<b>({i}/{len(parts)})</b>\n" + part
                     send_telegram(part)
 
-            # ---------- DEBUG LOOP LOG ----------
             print(
                 f"[LOOP] scanned={len(symbols)} new1h={len(updated_symbols)} signals={len(signals)} time={loop_started}",
                 flush=True
