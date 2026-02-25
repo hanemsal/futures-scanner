@@ -6,9 +6,9 @@ class Storage:
     def __init__(self, path: str = "state.json"):
         self.path = path
         self.state: Dict[str, Any] = {}
-        self.load()
+        self._load()
 
-    def load(self) -> None:
+    def _load(self) -> None:
         if os.path.exists(self.path):
             try:
                 with open(self.path, "r", encoding="utf-8") as f:
