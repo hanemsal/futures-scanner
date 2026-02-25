@@ -13,8 +13,13 @@ def send_telegram(text: str) -> None:
     payload = {
         "chat_id": TG_CHAT_ID,
         "text": text,
-        "disable_web_page_preview": True,
+        "parse_mode": "HTML",              # ✅ <b> çalışır
+        "disable_web_page_preview": True
     }
-    r = requests.post(url, json=payload, timeout=20)
-    if r.status_code != 200:
-        print("[WARN] Telegram send failed:", r.status_code, r.text)
+
+    try:
+        r = requests.post(url, json=payload, timeout=20)
+        if r.status_code != 200:
+            print("[WARN] Telegram send failed:", r.status_code, r.text)
+    except Exception as e:
+        print("[WARN] Telegram exception:", e)
