@@ -1,229 +1,392 @@
+# app.py  (FULL - FINAL)
 import os
 import time
-import requests
 from datetime import datetime, timezone
-from typing import List, Dict
+from typing import List, Dict, Tuple, Optional
+
+import requests
+
+from notify import send_telegram
+from storage import Storage
+
 
 # =========================
-# ENV CONFIG
+# ENV / AYARLAR
 # =========================
+BINANCE_FAPI = "https://fapi.binance.com"
 
-INTERVAL_SEC = int(os.getenv("INTERVAL_SEC", "600"))
-TF = os.getenv("TF", "30m")
+TF = os.getenv("TF", "30m")  # 30m
+INTERVAL_SEC = int(os.getenv("INTERVAL_SEC", "600"))  # 10 dk
+KLINE_LIMIT = int(os.getenv("KLINE_LIMIT", "200"))  # EMA41+RSI14 için yeterli
 
 EMA_FAST = int(os.getenv("EMA_FAST", "3"))
 EMA_SLOW = int(os.getenv("EMA_SLOW", "41"))
 RSI_LEN = int(os.getenv("RSI_LEN", "14"))
 
+TOP_N = int(os.getenv("TOP_N", "30"))  # telegramda listelenecek max coin
+
+MIN_QUOTE_VOLUME = float(os.getenv("MIN_QUOTE_VOLUME", "15000000"))  # 15M (USDT)
+COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "3600"))  # aynı coin mesajını 1 saat kilitle
+
+# BTC gate
 USE_BTC_FILTER = os.getenv("USE_BTC_FILTER", "1") == "1"
-BTC_SYMBOL = os.getenv("BTC_SYMBOL", "BTCUSDT")
+BTC_SYMBOL = os.getenv("BTC_SYMBOL", "BTCUSDT")  # Binance'te BTCUSDT olur. TradingView'deki .P değil.
 BTC_RSI_MIN = float(os.getenv("BTC_RSI_MIN", "42"))
 
-MIN_QUOTE_VOLUME = float(os.getenv("MIN_QUOTE_VOLUME", "15000000"))
-TOP_N = int(os.getenv("TOP_N", "30"))
-KLINE_LIMIT = int(os.getenv("KLINE_LIMIT", "200"))
-COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "3600"))
+# Storage
+USE_STORAGE = os.getenv("USE_STORAGE", "1") == "1"
+STORAGE_PATH = os.getenv("STORAGE_PATH", "state.json")
 
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
-TG_CHAT_ID = os.getenv("TG_CHAT_ID")
+# Telegram chunk limiti
+TG_CHUNK_LIMIT = int(os.getenv("TG_CHUNK_LIMIT", "3500"))
 
-BASE_URL = "https://fapi.binance.com"
-
-last_sent = {}
 
 # =========================
-# HELPERS
+# UTILS
 # =========================
-
-def now_utc():
+def utc_now_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-def send_telegram(msg: str):
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        print("Telegram config missing")
-        return
 
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-    data = {
-        "chat_id": TG_CHAT_ID,
-        "text": msg,
-        "parse_mode": "HTML"
-    }
-    requests.post(url, data=data, timeout=10)
+def safe_float(x, default=0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return default
 
-def fetch_symbols():
-    r = requests.get(f"{BASE_URL}/fapi/v1/exchangeInfo", timeout=10)
-    data = r.json()
-    return [
-        s["symbol"]
-        for s in data["symbols"]
-        if s["contractType"] == "PERPETUAL"
-        and s["quoteAsset"] == "USDT"
-        and s["status"] == "TRADING"
-    ]
-
-def fetch_klines(symbol: str):
-    r = requests.get(
-        f"{BASE_URL}/fapi/v1/klines",
-        params={"symbol": symbol, "interval": TF, "limit": KLINE_LIMIT},
-        timeout=10,
-    )
-    return r.json()
-
-def fetch_24h(symbol: str):
-    r = requests.get(
-        f"{BASE_URL}/fapi/v1/ticker/24hr",
-        params={"symbol": symbol},
-        timeout=10,
-    )
-    return r.json()
 
 # =========================
-# INDICATORS
+# TECH INDICATORS
 # =========================
+def ema(series: List[float], length: int) -> List[float]:
+    if length <= 1:
+        return series[:]
+    out = []
+    k = 2.0 / (length + 1.0)
+    ema_prev = series[0]
+    out.append(ema_prev)
+    for v in series[1:]:
+        ema_prev = (v * k) + (ema_prev * (1 - k))
+        out.append(ema_prev)
+    return out
 
-def ema(values: List[float], period: int):
-    k = 2 / (period + 1)
-    ema_vals = [values[0]]
-    for v in values[1:]:
-        ema_vals.append(v * k + ema_vals[-1] * (1 - k))
-    return ema_vals
 
-def rsi(values: List[float], period: int):
-    gains = []
-    losses = []
-    for i in range(1, len(values)):
-        diff = values[i] - values[i-1]
-        gains.append(max(diff, 0))
-        losses.append(abs(min(diff, 0)))
+def rsi(series: List[float], length: int) -> List[float]:
+    # Wilder RSI
+    if len(series) < length + 2:
+        return [50.0] * len(series)
 
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
+    deltas = [series[i] - series[i - 1] for i in range(1, len(series))]
+    gains = [max(d, 0.0) for d in deltas]
+    losses = [abs(min(d, 0.0)) for d in deltas]
 
-    rsis = []
-    for i in range(period, len(gains)):
-        avg_gain = (avg_gain * (period-1) + gains[i]) / period
-        avg_loss = (avg_loss * (period-1) + losses[i]) / period
-        rs = avg_gain / avg_loss if avg_loss != 0 else 0
-        rsis.append(100 - (100 / (1 + rs)))
+    avg_gain = sum(gains[:length]) / length
+    avg_loss = sum(losses[:length]) / length
+
+    rsis = [50.0] * (length)  # pad
+
+    for i in range(length, len(deltas)):
+        avg_gain = (avg_gain * (length - 1) + gains[i]) / length
+        avg_loss = (avg_loss * (length - 1) + losses[i]) / length
+        if avg_loss == 0:
+            rs = 999999
+        else:
+            rs = avg_gain / avg_loss
+        rsi_val = 100 - (100 / (1 + rs))
+        rsis.append(rsi_val)
+
+    # rsis length = len(series)-1, pad 1 to match series
+    rsis = [rsis[0]] + rsis
+    if len(rsis) < len(series):
+        rsis += [rsis[-1]] * (len(series) - len(rsis))
     return rsis
 
-# =========================
-# SCORING
-# =========================
-
-def score_symbol(rsi_val, ema_gap_pct, volume_m):
-    return (rsi_val * 0.4) + (ema_gap_pct * 30 * 0.4) + (volume_m * 0.00001 * 0.2)
 
 # =========================
-# MAIN SCAN
+# BINANCE FETCH
 # =========================
+def fetch_exchange_info() -> Dict:
+    url = f"{BINANCE_FAPI}/fapi/v1/exchangeInfo"
+    r = requests.get(url, timeout=15)
+    r.raise_for_status()
+    return r.json()
 
-def btc_gate():
+
+def fetch_ticker_24h() -> List[Dict]:
+    url = f"{BINANCE_FAPI}/fapi/v1/ticker/24hr"
+    r = requests.get(url, timeout=15)
+    r.raise_for_status()
+    return r.json()
+
+
+def fetch_klines(symbol: str) -> List[List]:
+    url = f"{BINANCE_FAPI}/fapi/v1/klines"
+    params = {"symbol": symbol, "interval": TF, "limit": KLINE_LIMIT}
+    r = requests.get(url, params=params, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+
+def get_usdt_perp_symbols() -> List[str]:
+    info = fetch_exchange_info()
+    symbols = []
+    for s in info.get("symbols", []):
+        # USDT perpetual + trading
+        if (
+            s.get("contractType") == "PERPETUAL"
+            and s.get("quoteAsset") == "USDT"
+            and s.get("status") == "TRADING"
+        ):
+            symbols.append(s["symbol"])
+    return symbols
+
+
+def build_quote_volume_map() -> Dict[str, float]:
+    # quoteVolume: 24h quote asset volume (USDT)
+    tickers = fetch_ticker_24h()
+    m = {}
+    for t in tickers:
+        sym = t.get("symbol")
+        qv = safe_float(t.get("quoteVolume", 0))
+        if sym:
+            m[sym] = qv
+    return m
+
+
+# =========================
+# SIGNAL LOGIC
+# =========================
+def last_closed_cross(closes: List[float]) -> Tuple[bool, bool, float, float, float]:
+    """
+    closes: already excluding last open candle
+    Returns:
+      fresh_cross: EMAfast crossed above EMAslow on the last closed candle
+      trend_ok: EMAfast > EMAslow currently (trend continues)
+      ef: last EMAfast
+      es: last EMAslow
+      gap_pct: (ef-es)/es * 100
+    """
+    ef_series = ema(closes, EMA_FAST)
+    es_series = ema(closes, EMA_SLOW)
+
+    ef_now, es_now = ef_series[-1], es_series[-1]
+    ef_prev, es_prev = ef_series[-2], es_series[-2]
+
+    trend_ok = ef_now > es_now
+    fresh_cross = (ef_prev <= es_prev) and (ef_now > es_now)
+
+    gap_pct = 0.0
+    if es_now != 0:
+        gap_pct = (ef_now - es_now) / es_now * 100.0
+
+    return fresh_cross, trend_ok, ef_now, es_now, gap_pct
+
+
+def score_coin(rsi_val: float, gap_pct: float, vol: float) -> float:
+    """
+    Basit skor:
+    - RSI 45-65 aralığı daha "sağlıklı" trend -> merkez 55'e yakınsa artar
+    - EMA gap çok şiştiyse biraz düşürür (çok şişince fake pullback olur)
+    - Volume yüksekse artar
+    """
+    # RSI skor (55'e yakın iyi)
+    rsi_score = max(0.0, 1.0 - abs(rsi_val - 55.0) / 25.0)  # 0..1
+
+    # gap skoru (0-2% iyi, 6%+ şişkin)
+    if gap_pct < 0:
+        gap_score = 0.0
+    elif gap_pct <= 2:
+        gap_score = 1.0
+    elif gap_pct <= 6:
+        gap_score = 1.0 - (gap_pct - 2.0) / 4.0  # 1 -> 0
+    else:
+        gap_score = 0.0
+
+    # volume skoru (15M referans)
+    vol_score = min(1.0, vol / max(MIN_QUOTE_VOLUME, 1.0))
+
+    # ağırlıklar
+    return (rsi_score * 0.45) + (gap_score * 0.35) + (vol_score * 0.20)
+
+
+def btc_gate() -> Tuple[bool, str]:
     if not USE_BTC_FILTER:
         return True, "BTC filter OFF"
 
     kl = fetch_klines(BTC_SYMBOL)
-    closes = [float(k[4]) for k in kl[:-1]]
+    closes = [float(k[4]) for k in kl[:-1]]  # sadece kapanmış mumlar
 
-    ema_f = ema(closes, EMA_FAST)
-    ema_s = ema(closes, EMA_SLOW)
-    rsi_vals = rsi(closes, RSI_LEN)
+    ef = ema(closes, EMA_FAST)
+    es = ema(closes, EMA_SLOW)
+    r = rsi(closes, RSI_LEN)
 
-    cond = ema_f[-1] > ema_s[-1] and rsi_vals[-1] > BTC_RSI_MIN
+    ema_condition = ef[-1] > es[-1]
+    rsi_condition = r[-1] > BTC_RSI_MIN
+    cond = ema_condition and rsi_condition
 
-    ema_condition = ema_f[-1] > ema_s[-1]
-msg = f"BTC gate: EMA{EMA_FAST}>{EMA_SLOW}={ema_condition} | RSI={rsi_vals[-1]:.2f} > {BTC_RSI_MIN}"
-
+    msg = (
+        f"BTC gate: EMA{EMA_FAST}>{EMA_SLOW}={ema_condition} | "
+        f"RSI={r[-1]:.2f} > {BTC_RSI_MIN}"
+    )
     return cond, msg
 
-def scan():
-    symbols = fetch_symbols()
-    rows = []
 
-    for sym in symbols:
+# =========================
+# TELEGRAM FORMAT
+# =========================
+def chunk_text(s: str, limit: int) -> List[str]:
+    if len(s) <= limit:
+        return [s]
+    parts = []
+    cur = ""
+    for line in s.split("\n"):
+        if len(cur) + len(line) + 1 > limit:
+            parts.append(cur.rstrip())
+            cur = ""
+        cur += line + "\n"
+    if cur.strip():
+        parts.append(cur.rstrip())
+    return parts
+
+
+def fmt_coin_line(sym: str, rsi_val: float, close: float, ef: float, es: float, gap_pct: float, vol: float, sc: float) -> str:
+    return (
+        f"• <b>{sym}</b> | RSI: {rsi_val:.2f} | Close: {close:.6g} | "
+        f"EMA{EMA_FAST}:{ef:.6g} > EMA{EMA_SLOW}:{es:.6g} | "
+        f"Gap: {gap_pct:.2f}% | Vol(24h): {vol/1e6:.1f}M | Score: {sc:.3f}"
+    )
+
+
+def build_message(fresh: List[Dict], cont: List[Dict], btc_msg: str) -> str:
+    header = f"📊 <b>Futures Scanner</b> (TF={TF}) | <i>{utc_now_str()}</i>\n{btc_msg}\n"
+    out = [header]
+
+    if fresh:
+        out.append("\n🟢 <b>FRESH CROSS (EMA fast yeni yukarı kesti)</b>")
+        for x in fresh[:TOP_N]:
+            out.append(fmt_coin_line(**x))
+    else:
+        out.append("\n🟢 <b>FRESH CROSS</b>\n— Yok")
+
+    if cont:
+        out.append("\n🟠 <b>TREND DEVAM (EMA fast hâlâ üstte)</b>")
+        for x in cont[:TOP_N]:
+            out.append(fmt_coin_line(**x))
+    else:
+        out.append("\n🟠 <b>TREND DEVAM</b>\n— Yok")
+
+    return "\n".join(out)
+
+
+# =========================
+# MAIN LOOP
+# =========================
+def main():
+    storage = Storage(STORAGE_PATH) if USE_STORAGE else None
+
+    while True:
+        t0 = time.time()
+
         try:
-            ticker = fetch_24h(sym)
-            qv = float(ticker["quoteVolume"])
-            if qv < MIN_QUOTE_VOLUME:
-                continue
+            gate_ok, gate_msg = btc_gate()
+        except Exception as e:
+            gate_ok, gate_msg = False, f"BTC gate error: {e}"
 
-            kl = fetch_klines(sym)
-            closes = [float(k[4]) for k in kl[:-1]]
-
-            ema_f = ema(closes, EMA_FAST)
-            ema_s = ema(closes, EMA_SLOW)
-
-            if len(ema_f) < 3:
-                continue
-
-            fresh_cross = ema_f[-2] < ema_s[-2] and ema_f[-1] > ema_s[-1]
-            trend_up = ema_f[-1] > ema_s[-1]
-
-            if not trend_up:
-                continue
-
-            rsi_vals = rsi(closes, RSI_LEN)
-            rsi_val = rsi_vals[-1]
-
-            gap_pct = (ema_f[-1] - ema_s[-1]) / ema_s[-1]
-            volume_m = qv / 1_000_000
-
-            sc = score_symbol(rsi_val, gap_pct, volume_m)
-
-            rows.append({
-                "symbol": sym,
-                "fresh": fresh_cross,
-                "score": sc,
-                "rsi": rsi_val,
-                "gap": gap_pct,
-                "vol": volume_m,
-                "close": closes[-1]
-            })
-
-        except:
-            continue
-
-    rows.sort(key=lambda x: x["score"], reverse=True)
-    return rows
-
-def format_message(rows, btc_msg):
-    header = f"📡 Futures Scanner (TF={TF}) | {now_utc()}\n{btc_msg}\n"
-
-    fresh = [r for r in rows if r["fresh"]]
-    trend = [r for r in rows if not r["fresh"]]
-
-    msg = header + "\n🚀 FRESH CROSS\n"
-    for r in fresh[:TOP_N]:
-        msg += f"{r['symbol']} | score={r['score']:.2f} | RSI={r['rsi']:.2f} | Vol={r['vol']:.1f}M\n"
-
-    msg += "\n📈 TREND DEVAM\n"
-    for r in trend[:TOP_N]:
-        msg += f"{r['symbol']} | score={r['score']:.2f} | RSI={r['rsi']:.2f} | Vol={r['vol']:.1f}M\n"
-
-    return msg
-
-# =========================
-# LOOP
-# =========================
-
-while True:
-    try:
-        gate, btc_msg = btc_gate()
-
-        if not gate:
-            send_telegram(f"📡 Futures Scanner (TF={TF}) | {now_utc()}\n{btc_msg}\n\nSinyal yok.")
+        if not gate_ok:
+            # sadece BTC durumu yazıp çıkma (spam olmasın)
+            print(f"[LOOP] BTC gate FALSE | {gate_msg} | {utc_now_str()}")
             time.sleep(INTERVAL_SEC)
             continue
 
-        rows = scan()
-        msg = format_message(rows, btc_msg)
+        try:
+            symbols = get_usdt_perp_symbols()
+            qv_map = build_quote_volume_map()
 
-        send_telegram(msg)
+            fresh_list = []
+            cont_list = []
 
-        print(f"[LOOP] scanned={len(rows)} sent=True time={now_utc()}")
+            scanned = 0
+            for sym in symbols:
+                scanned += 1
+                vol = qv_map.get(sym, 0.0)
+                if vol < MIN_QUOTE_VOLUME:
+                    continue
 
-    except Exception as e:
-        print("ERROR:", e)
+                # cooldown
+                if storage:
+                    last_ts = storage.get(sym, 0)
+                    if last_ts and (time.time() - last_ts) < COOLDOWN_SEC:
+                        continue
 
-    time.sleep(INTERVAL_SEC)
+                try:
+                    kl = fetch_klines(sym)
+                    closes = [float(k[4]) for k in kl[:-1]]  # sadece kapanmış mum
+                    if len(closes) < max(EMA_SLOW + 5, RSI_LEN + 5):
+                        continue
+
+                    fresh_cross, trend_ok, ef, es, gap_pct = last_closed_cross(closes)
+                    if not trend_ok:
+                        continue
+
+                    r = rsi(closes, RSI_LEN)
+                    rsi_val = r[-1]
+                    close = closes[-1]
+
+                    sc = score_coin(rsi_val, gap_pct, vol)
+
+                    item = dict(
+                        sym=sym,
+                        rsi_val=rsi_val,
+                        close=close,
+                        ef=ef,
+                        es=es,
+                        gap_pct=gap_pct,
+                        vol=vol,
+                        sc=sc
+                    )
+
+                    if fresh_cross:
+                        fresh_list.append(item)
+                    else:
+                        cont_list.append(item)
+
+                except Exception:
+                    continue
+
+            # skorla sırala
+            fresh_list.sort(key=lambda x: x["sc"], reverse=True)
+            cont_list.sort(key=lambda x: x["sc"], reverse=True)
+
+            # mesaj gönderme koşulu: liste varsa
+            if fresh_list or cont_list:
+                msg = build_message(fresh_list, cont_list, btc_msg=gate_msg)
+
+                chunks = chunk_text(msg, TG_CHUNK_LIMIT)
+                for c in chunks:
+                    send_telegram(c)
+
+                if storage:
+                    # mesaj attıklarımızı cooldown'a al
+                    now = int(time.time())
+                    for x in fresh_list[:TOP_N]:
+                        storage.set(x["sym"], now)
+                    for x in cont_list[:TOP_N]:
+                        storage.set(x["sym"], now)
+                    storage.save()
+
+                signals = len(fresh_list) + len(cont_list)
+                print(f"[LOOP] scanned={scanned} symbols | fresh={len(fresh_list)} cont={len(cont_list)} total={signals} | {utc_now_str()}")
+            else:
+                print(f"[LOOP] scanned={len(symbols)} symbols | no candidates | {utc_now_str()}")
+
+        except Exception as e:
+            print(f"[ERROR] {e} | {utc_now_str()}")
+
+        # uyku
+        dt = time.time() - t0
+        sleep_for = max(3, INTERVAL_SEC - int(dt))
+        time.sleep(sleep_for)
+
+
+if __name__ == "__main__":
+    main()
