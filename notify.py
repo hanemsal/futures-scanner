@@ -13,8 +13,8 @@ def send_telegram(text: str) -> None:
     payload = {
         "chat_id": TG_CHAT_ID,
         "text": text,
-        "parse_mode": "HTML",              # <<< BUNU EKLEDİK
-        "disable_web_page_preview": True,
+        "parse_mode": "HTML",              # ✅ <b> <i> çalışsın
+        "disable_web_page_preview": True
     }
 
     try:
@@ -22,4 +22,4 @@ def send_telegram(text: str) -> None:
         if r.status_code != 200:
             print("[WARN] Telegram send failed:", r.status_code, r.text)
     except Exception as e:
-        print("[WARN] Telegram send exception:", e)
+        print("[WARN] Telegram exception:", e)
