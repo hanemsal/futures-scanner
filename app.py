@@ -132,7 +132,8 @@ def btc_gate():
 
     cond = ema_f[-1] > ema_s[-1] and rsi_vals[-1] > BTC_RSI_MIN
 
-    msg = f"BTC gate: EMA{EMA_FAST}>{EMA_SLOW}={ema_f[-1]>ema_s[-1} | RSI={rsi_vals[-1]:.2f} > {BTC_RSI_MIN}"
+    ema_condition = ema_f[-1] > ema_s[-1]
+msg = f"BTC gate: EMA{EMA_FAST}>{EMA_SLOW}={ema_condition} | RSI={rsi_vals[-1]:.2f} > {BTC_RSI_MIN}"
 
     return cond, msg
 
