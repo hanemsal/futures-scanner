@@ -1,25 +1,16 @@
-import os
 import requests
 
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
-TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
-
-def send_telegram(text: str) -> None:
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        print("[WARN] Telegram env missing (TG_BOT_TOKEN / TG_CHAT_ID). Message:\n", text)
+def send_telegram(bot_token: str, chat_id: str, text: str, timeout: int = 20) -> None:
+    if not bot_token or not chat_id or not text:
         return
-
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {
-        "chat_id": TG_CHAT_ID,
+        "chat_id": chat_id,
         "text": text,
-        "parse_mode": "HTML",              # ✅ <b> <i> çalışsın
+        "parse_mode": "HTML",
         "disable_web_page_preview": True
     }
-
     try:
-        r = requests.post(url, json=payload, timeout=20)
-        if r.status_code != 200:
-            print("[WARN] Telegram send failed:", r.status_code, r.text)
-    except Exception as e:
-        print("[WARN] Telegram exception:", e)
+        requests.post(url, json=payload, timeout=timeout)
+    except Exception:
+        pass
