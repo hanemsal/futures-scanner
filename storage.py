@@ -1,32 +1,42 @@
 import json
 import os
-from typing import Any, Dict
+import time
+from typing import Dict, Any
 
 class Storage:
-    def __init__(self, path: str = "state.json"):
+    def __init__(self, path: str):
         self.path = path
-        self.state: Dict[str, Any] = {}
+        self.data: Dict[str, Any] = {}
         self._load()
 
     def _load(self) -> None:
-        if os.path.exists(self.path):
-            try:
-                with open(self.path, "r", encoding="utf-8") as f:
-                    self.state = json.load(f)
-            except Exception:
-                self.state = {}
-        else:
-            self.state = {}
+        if not self.path:
+            self.data = {}
+            return
+        if not os.path.exists(self.path):
+            self.data = {}
+            return
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                self.data = json.load(f)
+        except Exception:
+            self.data = {}
 
     def save(self) -> None:
+        if not self.path:
+            return
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         try:
             with open(self.path, "w", encoding="utf-8") as f:
-                json.dump(self.state, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            print("[WARN] state save failed:", e)
+                json.dump(self.data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
-    def get(self, key: str, default=None):
-        return self.state.get(key, default)
+    def can_send(self, key: str, cooldown_sec: int) -> bool:
+        now = int(time.time())
+        last = int(self.data.get(key, 0) or 0)
+        return (now - last) >= cooldown_sec
 
-    def set(self, key: str, value) -> None:
-        self.state[key] = value
+    def mark_sent(self, key: str) -> None:
+        self.data[key] = int(time.time())
+        self.save()
