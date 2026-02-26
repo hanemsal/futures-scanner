@@ -34,10 +34,14 @@ TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 TG_CHUNK_LIMIT = int(os.getenv("TG_CHUNK_LIMIT", "3500"))
 
+# DEBUG / HEARTBEAT
+DEBUG = int(os.getenv("DEBUG", "0"))
+HEARTBEAT_SEC = int(os.getenv("HEARTBEAT_SEC", str(INTERVAL_SEC)))
+
 # BTC filter
 USE_BTC_FILTER = int(os.getenv("USE_BTC_FILTER", "0"))
 BTC_SYMBOL = os.getenv("BTC_SYMBOL", "BTCUSDT")
-BTC_RSI_MIN = float(os.getenv("BTC_RSI_MIN", "0"))  # örn 45
+BTC_RSI_MIN = float(os.getenv("BTC_RSI_MIN", "0"))  # örn 42
 
 # Premium filters
 USE_SMA_FILTER = int(os.getenv("USE_SMA_FILTER", "1"))
@@ -45,7 +49,15 @@ SMA_LEN = int(os.getenv("SMA_LEN", "47"))
 
 USE_VOL_FILTER = int(os.getenv("USE_VOL_FILTER", "1"))
 VOL_LEN = int(os.getenv("VOL_LEN", "20"))
-VOL_MULT = float(os.getenv("VOL_MULT", "1.3"))
+
+# VOL multiplier - farklı isimlerle gelen ENV'lere uyum
+_VOL_MULT_RAW = (
+    os.getenv("VOL_MULT")
+    or os.getenv("VOL_MULT")
+    or os.getenv("VOL_MULTIPLIER")
+    or "1.3"
+)
+VOL_MULT = float(_VOL_MULT_RAW)
 
 USE_MACD_NEAR0 = int(os.getenv("USE_MACD_NEAR0", "1"))
 
@@ -164,41 +176,40 @@ def get_klines(symbol: str, interval: str, limit: int) -> List[List[Any]]:
 # Signal logic + plan
 # =========================
 def compute_long_signal(symbol: str, kl: List[List[Any]]) -> Optional[Dict[str, Any]]:
-    # Use last CLOSED candle: index -2
     closes = [float(x[4]) for x in kl]
     highs  = [float(x[2]) for x in kl]
     lows   = [float(x[3]) for x in kl]
     vols   = [float(x[5]) for x in kl]
     close_times = [int(x[6]) for x in kl]  # close time ms
 
-    if len(closes) < max(EMA_SLOW, RSI_LEN, 200, ATR_LEN, SWING_LEN) + 5:
+    need = max(EMA_SLOW, RSI_LEN, 200, ATR_LEN, SWING_LEN) + 5
+    if len(closes) < need:
         return None
 
+    # last CLOSED candle
     i = len(closes) - 2
     if i < 5:
         return None
 
     ema_fast = ema(closes, EMA_FAST)
     ema_slow = ema(closes, EMA_SLOW)
-
     cross_up = (ema_fast[i - 1] <= ema_slow[i - 1]) and (ema_fast[i] > ema_slow[i])
 
     r = rsi(closes, RSI_LEN)
     rsi_ok = (not math.isnan(r[i])) and (r[i] >= RSI_MIN) and (r[i] > r[i - 1])
 
-    sma47 = sma(closes, SMA_LEN)
+    sma_trend = sma(closes, SMA_LEN)
     trend_ok = True
-    if USE_SMA_FILTER == 1 and not math.isnan(sma47[i]):
-        trend_ok = closes[i] > sma47[i]
+    if USE_SMA_FILTER == 1 and not math.isnan(sma_trend[i]):
+        trend_ok = closes[i] > sma_trend[i]
 
     vol_sma = sma(vols, VOL_LEN)
     vol_ok = True
     vol_ratio = None
+    if not math.isnan(vol_sma[i]) and vol_sma[i] > 0:
+        vol_ratio = vols[i] / vol_sma[i]
     if USE_VOL_FILTER == 1 and not math.isnan(vol_sma[i]) and vol_sma[i] > 0:
-        vol_ratio = vols[i] / vol_sma[i]
         vol_ok = vols[i] > vol_sma[i] * VOL_MULT
-    elif not math.isnan(vol_sma[i]) and vol_sma[i] > 0:
-        vol_ratio = vols[i] / vol_sma[i]
 
     macd_line, sig_line, hist = macd(closes, 12, 26, 9)
     hist_up = hist[i] > hist[i - 1]
@@ -219,32 +230,30 @@ def compute_long_signal(symbol: str, kl: List[List[Any]]) -> Optional[Dict[str, 
     atr14 = atr(highs, lows, closes, ATR_LEN)
     atr_i = atr14[i] if not math.isnan(atr14[i]) else 0.0
 
-    signal_close = closes[i]
+    entry = closes[i]
     signal_low = lows[i]
 
     swing_start = max(0, i - SWING_LEN + 1)
     swing_low = min(lows[swing_start:i + 1])
 
     sl = min(signal_low, swing_low) - (0.10 * atr_i)
-    # avoid weird negative SL on tiny coins
     sl = max(sl, 0.0)
 
-    r_val = signal_close - sl
+    r_val = entry - sl
     if r_val <= 0:
         return None
 
-    tp1 = signal_close + 1.0 * r_val
-    tp2 = signal_close + 2.0 * r_val
-    tp3 = signal_close + 3.0 * r_val
+    tp1 = entry + 1.0 * r_val
+    tp2 = entry + 2.0 * r_val
+    tp3 = entry + 3.0 * r_val
 
-    # time
     ts = datetime.fromtimestamp(close_times[i] / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     return {
         "symbol": symbol,
         "tf": TF,
         "time": ts,
-        "entry": signal_close,
+        "entry": entry,
         "sl": sl,
         "tp1": tp1,
         "tp2": tp2,
@@ -255,13 +264,10 @@ def compute_long_signal(symbol: str, kl: List[List[Any]]) -> Optional[Dict[str, 
         "macd_hist_up": hist_up,
         "macd_near0": macd_near0,
         "vol_ratio": vol_ratio,
-        "ema_fast": ema_fast[i],
-        "ema_slow": ema_slow[i],
     }
 
 def format_signal_msg(sig: Dict[str, Any]) -> str:
     def f(x: float) -> str:
-        # pretty format for large/small numbers
         if x == 0:
             return "0"
         if x >= 100:
@@ -274,7 +280,7 @@ def format_signal_msg(sig: Dict[str, Any]) -> str:
     vol_txt = "n/a" if vol_ratio is None else f"{vol_ratio:.2f}x"
 
     msg = []
-    msg.append("🚀 <b>LONG BREAKOUT</b> (EMA{}↑EMA{})".format(EMA_FAST, EMA_SLOW))
+    msg.append(f"🚀 <b>LONG BREAKOUT</b> (EMA{EMA_FAST}↑EMA{EMA_SLOW})")
     msg.append(f"<b>SYMBOL:</b> {sig['symbol']}   <b>TF:</b> {sig['tf']}")
     msg.append(f"<b>Time (closed candle):</b> {sig['time']}")
     msg.append("")
@@ -286,7 +292,7 @@ def format_signal_msg(sig: Dict[str, Any]) -> str:
     msg.append("")
     msg.append(f"<b>RSI({RSI_LEN}):</b> {sig['rsi']:.2f} {'(↑)' if sig['rsi_up'] else '(↓)'}")
     msg.append(f"<b>MACD hist:</b> {sig['macd_hist']:+.6f} {'(↑)' if sig['macd_hist_up'] else '(↓)'} | near0: {'✅' if sig['macd_near0'] else '❌'}")
-    msg.append(f"<b>Vol:</b> {vol_txt} (vs SMA{VOL_LEN})")
+    msg.append(f"<b>Vol:</b> {vol_txt} (vs SMA{VOL_LEN}, mult={VOL_MULT})")
     msg.append("")
     msg.append("<b>Plan:</b>")
     msg.append("- TP1 görünce SL = ENTRY (break-even)")
@@ -319,7 +325,7 @@ def btc_filter_pass() -> Tuple[bool, str]:
         return True, "BTC filter: OFF"
 
     try:
-        kl = get_klines(BTC_SYMBOL, TF, max(KLINE_LIMIT, RSI_LEN + 5))
+        kl = get_klines(BTC_SYMBOL, TF, max(KLINE_LIMIT, RSI_LEN + 10))
         closes = [float(x[4]) for x in kl]
         r = rsi(closes, RSI_LEN)
         i = len(closes) - 2
@@ -335,12 +341,27 @@ def btc_filter_pass() -> Tuple[bool, str]:
 # =========================
 def main():
     storage = Storage(STORAGE_PATH) if USE_STORAGE == 1 else None
+    last_hb = 0
+
+    if DEBUG == 1:
+        send_telegram(
+            TG_BOT_TOKEN,
+            TG_CHAT_ID,
+            f"✅ Bot started | TF={TF} | TOP_N={TOP_N} | MIN_QV={int(MIN_QUOTE_VOLUME)} | DEBUG=1",
+            timeout=20
+        )
 
     while True:
+        scanned = 0
+        signal_count = 0
+        hb_note = ""
+
         try:
             btc_ok, btc_reason = btc_filter_pass()
             if not btc_ok:
-                send_telegram(TG_BOT_TOKEN, TG_CHAT_ID, f"⛔️ {btc_reason}\nSinyaller pas geçildi.", timeout=20)
+                # BTC filtre açıkken bloklarsa DEBUG modda bildir, normalde sessiz
+                if DEBUG == 1:
+                    send_telegram(TG_BOT_TOKEN, TG_CHAT_ID, f"⛔️ {btc_reason} | Sinyaller pas geçildi.", timeout=20)
                 time.sleep(INTERVAL_SEC)
                 continue
 
@@ -365,6 +386,8 @@ def main():
 
             signals = []
             for sym, _qv in candidates:
+                scanned += 1
+
                 # cooldown
                 key = f"{sym}:{TF}:LONG"
                 if storage and not storage.can_send(key, COOLDOWN_SEC):
@@ -380,6 +403,9 @@ def main():
                 except Exception:
                     continue
 
+            signal_count = len(signals)
+            hb_note = f"{btc_reason} | candidates={len(candidates)} scanned={scanned} signals={signal_count}"
+
             if signals:
                 msgs = [format_signal_msg(s) for s in signals]
                 chunks = chunk_messages(msgs, TG_CHUNK_LIMIT)
@@ -387,12 +413,21 @@ def main():
                 send_telegram(TG_BOT_TOKEN, TG_CHAT_ID, header, timeout=20)
                 for ch in chunks:
                     send_telegram(TG_BOT_TOKEN, TG_CHAT_ID, ch, timeout=20)
-            else:
-                # istersen sessiz kalsın; debug istersen açarız
-                pass
 
         except Exception as e:
-            send_telegram(TG_BOT_TOKEN, TG_CHAT_ID, f"⚠️ Scanner error: {e}", timeout=20)
+            if DEBUG == 1:
+                send_telegram(TG_BOT_TOKEN, TG_CHAT_ID, f"⚠️ Scanner error: {e}", timeout=20)
+
+        # Heartbeat (DEBUG)
+        now = int(time.time())
+        if DEBUG == 1 and (now - last_hb) >= HEARTBEAT_SEC:
+            last_hb = now
+            send_telegram(
+                TG_BOT_TOKEN,
+                TG_CHAT_ID,
+                f"🫀 HB | TF={TF} | TOP_N={TOP_N} | MIN_QV={int(MIN_QUOTE_VOLUME)} | {hb_note}",
+                timeout=20
+            )
 
         time.sleep(INTERVAL_SEC)
 
