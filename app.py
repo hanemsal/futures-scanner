@@ -158,10 +158,13 @@ def main():
         cooldown_sec=COOLDOWN_SEC
     )
 
-    print("BOT STARTED")
-    last_hb = time.time()
+ print("BOT STARTED")
 
-    while True:
+send_telegram("✅ futures-scanner test mesajı")
+
+last_hb = time.time()
+
+while True:
         sent = 0
         try:
             symbols = get_symbols()
