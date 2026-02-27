@@ -7,7 +7,6 @@ from typing import Any, Dict, Optional
 class Storage:
     """
     Basit JSON dosya storage.
-    - enabled: True ise aktif, False ise pasif (hiç yazmaz/okumaz)
     - cooldown_sec: aynı key'in tekrar sinyal vermesini engeller
     """
 
@@ -15,7 +14,7 @@ class Storage:
         self.path = (path or "state.json").strip()
         self.enabled = bool(enabled)
         self.cooldown_sec = int(cooldown_sec) if cooldown_sec is not None else 3600
-        self._data: Dict[str, Any] = {"sent": {}}  # { key: last_ts }
+        self._data: Dict[str, Any] = {"sent": {}}
 
         if self.enabled:
             self._load()
@@ -42,7 +41,7 @@ class Storage:
         except Exception:
             pass
 
-    def can_send(self, key: str, now_ts: Optional[int] = None) -> bool:
+    def should_send(self, key: str, now_ts: Optional[int] = None) -> bool:
         """cooldown dolduysa True"""
         if not self.enabled:
             return True
