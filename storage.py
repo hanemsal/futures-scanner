@@ -1,4 +1,3 @@
-# storage.py
 import json
 import os
 import time
@@ -8,15 +7,15 @@ from typing import Any, Dict, Optional
 class Storage:
     """
     Basit JSON dosya storage.
-    - enabled: 1 ise aktif, 0 ise pasif (hiç yazmaz/okumaz)
-    - cooldown_sec: aynı sembolün tekrar sinyal vermesini engeller
+    - enabled: True ise aktif, False ise pasif (hiç yazmaz/okumaz)
+    - cooldown_sec: aynı key'in tekrar sinyal vermesini engeller
     """
 
     def __init__(self, path: str, enabled: bool = True, cooldown_sec: int = 3600):
-        self.path = path or "state.json"
+        self.path = (path or "state.json").strip()
         self.enabled = bool(enabled)
         self.cooldown_sec = int(cooldown_sec) if cooldown_sec is not None else 3600
-        self._data: Dict[str, Any] = {"sent": {}}  # { symbol: last_ts }
+        self._data: Dict[str, Any] = {"sent": {}}  # { key: last_ts }
 
         if self.enabled:
             self._load()
@@ -29,28 +28,22 @@ class Storage:
             if "sent" not in self._data or not isinstance(self._data["sent"], dict):
                 self._data["sent"] = {}
         except Exception:
-            # bozuk dosya vs -> sıfırla
             self._data = {"sent": {}}
 
     def _save(self) -> None:
         if not self.enabled:
             return
         try:
-            # Render disk yazma izinleri için güvenli klasör
             dir_name = os.path.dirname(self.path)
             if dir_name:
                 os.makedirs(dir_name, exist_ok=True)
             with open(self.path, "w", encoding="utf-8") as f:
                 json.dump(self._data, f, ensure_ascii=False, indent=2)
         except Exception:
-            # yazamazsa sessiz geç
             pass
 
-    def should_send(self, key: str, now_ts: Optional[int] = None) -> bool:
-        """
-        key: symbol gibi unique anahtar
-        cooldown süresi dolmadan tekrar gönderme.
-        """
+    def can_send(self, key: str, now_ts: Optional[int] = None) -> bool:
+        """cooldown dolduysa True"""
         if not self.enabled:
             return True
 
