@@ -9,458 +9,305 @@ import requests
 from notify import send_telegram
 from storage import Storage
 
+
 # =========================
-# ENV / AYARLAR
+# ENV
 # =========================
+
 BINANCE_FAPI = os.getenv("BINANCE_FAPI", "https://fapi.binance.com").rstrip("/")
 
-DEBUG = int(os.getenv("DEBUG", "0"))
+DEBUG = int(os.getenv("DEBUG", "1"))
+
 INTERVAL_SEC = int(os.getenv("INTERVAL_SEC", "60"))
 HEARTBEAT_SEC = int(os.getenv("HEARTBEAT_SEC", "600"))
 
 KLINE_LIMIT = int(os.getenv("KLINE_LIMIT", "260"))
-TOP_N = int(os.getenv("TOP_N", "250"))
+
+TOP_N = int(os.getenv("TOP_N", "80"))
 MIN_QUOTE_VOLUME = float(os.getenv("MIN_QUOTE_VOLUME", "3000000"))
 
-# EMA (trend)
 EMA_FAST = int(os.getenv("EMA_FAST", "3"))
 EMA_SLOW = int(os.getenv("EMA_SLOW", "44"))
 
-# RSI (30m) – RSI123 + EMA47
 RSI_LEN = int(os.getenv("RSI_LEN", "123"))
 RSI_EMA_LEN = int(os.getenv("RSI_EMA_LEN", "47"))
 RSI_MIN = float(os.getenv("RSI_MIN", "50"))
-REQUIRE_RSI_CROSS = int(os.getenv("REQUIRE_RSI_CROSS", "0"))  # 1 ise RSI EMA'yı yakın zamanda kesmiş olmalı
-RSI_CROSS_LOOKBACK = int(os.getenv("RSI_CROSS_LOOKBACK", "3"))  # kaç mum geriye bak
 
-# MACD (5m)
-USE_MACD_NEAR0 = int(os.getenv("USE_MACD_NEAR0", "1"))  # 1 => |macd| <= threshold
-MACD_NEAR0 = float(os.getenv("MACD_NEAR0", "0.00002"))
-MACD_POSITIVE = int(os.getenv("MACD_POSITIVE", "1"))  # near0 kapalıysa 1 => macd>0
-
-# BTC filtresi (opsiyonel)
-USE_BTC_FILTER = int(os.getenv("USE_BTC_FILTER", "0"))
-BTC_SYMBOL = os.getenv("BTC_SYMBOL", "BTCUSDT")
-BTC_RSI_MIN = float(os.getenv("BTC_RSI_MIN", "42"))
-
-# Storage / cooldown
 USE_STORAGE = int(os.getenv("USE_STORAGE", "1"))
-STORAGE_PATH = os.getenv("STORAGE_PATH", "state.json")
+STORAGE_PATH = os.getenv("STORAGE_PATH", "/tmp/futures_storage.json")
 COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "3600"))
 
-# Risk / TP-Stop
-ATR_LEN = int(os.getenv("ATR_LEN", "14"))
-ATR_MULT = float(os.getenv("ATR_MULT", "1.0"))  # SL = SwingLow - ATR*mult
-SWING_LEN = int(os.getenv("SWING_LEN", "20"))   # SwingLow lookback (1H)
-TP_R1 = float(os.getenv("TP_R1", "1.0"))
-TP_R2 = float(os.getenv("TP_R2", "2.0"))
-TP_R3 = float(os.getenv("TP_R3", "3.0"))
-
-# Volume filter (opsiyonel)
-USE_VOL_FILTER = int(os.getenv("USE_VOL_FILTER", "1"))
-VOL_LEN = int(os.getenv("VOL_LEN", "20"))
-VOL_MULT = float(os.getenv("VOL_MULT", "1.1"))
-
-# timeframes (sabit)
-TF_TREND_1H = "1h"
-TF_TREND_30M = "30m"
-TF_TRIGGER_5M = "5m"
+TF_1H = "1h"
+TF_30M = "30m"
+TF_5M = "5m"
 
 
 # =========================
 # HTTP
 # =========================
-def _get_json(url: str, params: Optional[dict] = None, timeout: int = 20):
-    r = requests.get(url, params=params, timeout=timeout)
+
+def get_json(url: str, params=None):
+
+    r = requests.get(url, params=params, timeout=20)
     r.raise_for_status()
     return r.json()
 
 
-def get_klines(symbol: str, interval: str, limit: int) -> List[List]:
-    return _get_json(
+def get_klines(symbol, tf, limit):
+
+    return get_json(
+
         f"{BINANCE_FAPI}/fapi/v1/klines",
-        params={"symbol": symbol, "interval": interval, "limit": limit},
+
+        params=dict(
+
+            symbol=symbol,
+
+            interval=tf,
+
+            limit=limit
+
+        )
+
     )
 
 
-def parse_ohlcv(kl: List[List]) -> Tuple[List[int], List[float], List[float], List[float], List[float], List[float]]:
-    # returns close_time_ms, open, high, low, close, volume
-    ct = [int(k[6]) for k in kl]
-    o = [float(k[1]) for k in kl]
-    h = [float(k[2]) for k in kl]
-    l = [float(k[3]) for k in kl]
-    c = [float(k[4]) for k in kl]
-    v = [float(k[5]) for k in kl]
-    return ct, o, h, l, c, v
+# =========================
+# PARSE
+# =========================
 
+def parse_ohlcv(kl):
 
-def get_top_symbols_by_quote_volume(top_n: int, min_quote_vol: float) -> List[str]:
-    data = _get_json(f"{BINANCE_FAPI}/fapi/v1/ticker/24hr")
-    rows = []
-    for x in data:
-        sym = x.get("symbol", "")
-        if not sym.endswith("USDT"):
-            continue
-        try:
-            qv = float(x.get("quoteVolume", 0.0))
-        except Exception:
-            continue
-        if qv >= min_quote_vol:
-            rows.append((sym, qv))
-    rows.sort(key=lambda t: t[1], reverse=True)
-    return [s for s, _ in rows[:top_n]]
+    close_time = [int(x[6]) for x in kl]
+
+    open = [float(x[1]) for x in kl]
+    high = [float(x[2]) for x in kl]
+    low = [float(x[3]) for x in kl]
+    close = [float(x[4]) for x in kl]
+    vol = [float(x[5]) for x in kl]
+
+    return close_time, open, high, low, close, vol
 
 
 # =========================
 # INDICATORS
 # =========================
-def ema(series: List[float], length: int) -> List[float]:
-    if not series or length <= 0:
-        return []
-    k = 2 / (length + 1)
-    out = [series[0]]
-    for i in range(1, len(series)):
-        out.append(series[i] * k + out[-1] * (1 - k))
+
+def ema(data, length):
+
+    k = 2/(length+1)
+
+    out=[data[0]]
+
+    for i in range(1,len(data)):
+
+        out.append(
+
+            data[i]*k + out[-1]*(1-k)
+
+        )
+
     return out
 
 
-def crossed_up(prev_a: float, prev_b: float, now_a: float, now_b: float) -> bool:
-    return (prev_a <= prev_b) and (now_a > now_b)
+def crossed_up(prev_a, prev_b, now_a, now_b):
+
+    return prev_a <= prev_b and now_a > now_b
 
 
-def rsi_series(closes: List[float], length: int) -> List[float]:
-    if len(closes) < length + 1:
-        return []
-    rsis = [float("nan")] * len(closes)
-    for i in range(length, len(closes)):
-        gains = 0.0
-        losses = 0.0
-        for j in range(i - length + 1, i + 1):
-            diff = closes[j] - closes[j - 1]
-            if diff >= 0:
-                gains += diff
+def rsi(data, length):
+
+    rsis=[None]*len(data)
+
+    for i in range(length,len(data)):
+
+        gain=0
+        loss=0
+
+        for j in range(i-length+1,i+1):
+
+            diff=data[j]-data[j-1]
+
+            if diff>=0:
+                gain+=diff
             else:
-                losses += -diff
-        if losses == 0:
-            rsis[i] = 100.0
+                loss+=abs(diff)
+
+        if loss==0:
+            rsis[i]=100
         else:
-            rs = gains / losses
-            rsis[i] = 100 - (100 / (1 + rs))
+            rs=gain/loss
+            rsis[i]=100-(100/(1+rs))
+
     return rsis
 
 
-def find_recent_cross_up(a: List[float], b: List[float], lookback: int) -> bool:
-    if len(a) < lookback + 2 or len(b) < lookback + 2:
-        return False
-    for k in range(1, lookback + 1):
-        if crossed_up(a[-(k + 1)], b[-(k + 1)], a[-k], b[-k]):
-            return True
-    return False
-
-
-def macd_last(closes: List[float], fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[float, float, float]:
-    if len(closes) < slow + signal + 5:
-        return (float("nan"), float("nan"), float("nan"))
-    ef = ema(closes, fast)
-    es = ema(closes, slow)
-    n = min(len(ef), len(es))
-    macd_line = [ef[-n + i] - es[-n + i] for i in range(n)]
-    sig = ema(macd_line, signal)
-    if not sig:
-        return (float("nan"), float("nan"), float("nan"))
-    hist = macd_line[-1] - sig[-1]
-    return (macd_line[-1], sig[-1], hist)
-
-
-def atr_wilder(highs: List[float], lows: List[float], closes: List[float], length: int) -> float:
-    """Wilder ATR (RMA). Return last ATR."""
-    if len(closes) < length + 2:
-        return float("nan")
-
-    trs: List[float] = []
-    for i in range(1, len(closes)):
-        tr = max(
-            highs[i] - lows[i],
-            abs(highs[i] - closes[i - 1]),
-            abs(lows[i] - closes[i - 1]),
-        )
-        trs.append(tr)
-
-    first = sum(trs[:length]) / length
-    atr = first
-    for tr in trs[length:]:
-        atr = (atr * (length - 1) + tr) / length
-    return atr
-
-
-def sma_last(series: List[float], length: int) -> float:
-    if len(series) < length:
-        return float("nan")
-    return sum(series[-length:]) / length
-
-
 # =========================
-# FILTERS
+# SYMBOL LIST
 # =========================
-def btc_filter_ok() -> bool:
-    if USE_BTC_FILTER != 1:
-        return True
-    try:
-        kl = get_klines(BTC_SYMBOL, TF_TREND_1H, KLINE_LIMIT)
-        _, _, _, _, closes, _ = parse_ohlcv(kl)
-        rsi_btc = rsi_series(closes, RSI_LEN)
-        rsi_btc_clean = [x for x in rsi_btc if not math.isnan(x)]
-        if not rsi_btc_clean:
-            return False
-        return rsi_btc_clean[-1] >= BTC_RSI_MIN
-    except Exception:
-        return False
 
+def get_symbols():
 
-def check_signal(symbol: str) -> Optional[Dict]:
-    # ---- 1H data (trend + ATR + swing + vol)
-    kl1h = get_klines(symbol, TF_TREND_1H, KLINE_LIMIT)
-    ct1h, _, h1h, l1h, c1h, v1h = parse_ohlcv(kl1h)
+    data=get_json(
 
-    e1h_fast = ema(c1h, EMA_FAST)
-    e1h_slow = ema(c1h, EMA_SLOW)
-    if not e1h_fast or not e1h_slow:
-        return None
-    trend_1h = e1h_fast[-1] > e1h_slow[-1]
-
-    # ATR + SwingLow (1H)
-    atr = atr_wilder(h1h, l1h, c1h, ATR_LEN)
-    if math.isnan(atr):
-        return None
-    if len(l1h) < SWING_LEN + 2:
-        return None
-    swing_low = min(l1h[-SWING_LEN:])
-
-    # Volume ratio (1H)
-    vol_ratio = None
-    vol_sma = sma_last(v1h, VOL_LEN)
-    if not math.isnan(vol_sma) and vol_sma > 0:
-        vol_ratio = v1h[-1] / vol_sma
-
-    if USE_VOL_FILTER == 1:
-        if vol_ratio is None:
-            return None
-        if vol_ratio < VOL_MULT:
-            return None
-
-    closed_1h_time = datetime.fromtimestamp(ct1h[-1] / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-
-    # ---- 30m data (trend + RSI123)
-    kl30 = get_klines(symbol, TF_TREND_30M, KLINE_LIMIT)
-    _, _, _, _, c30, _ = parse_ohlcv(kl30)
-
-    e30_fast = ema(c30, EMA_FAST)
-    e30_slow = ema(c30, EMA_SLOW)
-    if not e30_fast or not e30_slow:
-        return None
-    trend_30m = e30_fast[-1] > e30_slow[-1]
-
-    rsi30 = rsi_series(c30, RSI_LEN)
-    if not rsi30 or math.isnan(rsi30[-1]):
-        return None
-    rsi30_clean = [x for x in rsi30 if not math.isnan(x)]
-    if len(rsi30_clean) < RSI_EMA_LEN + 5:
-        return None
-    rsi30_ema = ema(rsi30_clean, RSI_EMA_LEN)
-
-    rsi_last = rsi30_clean[-1]
-    rsi_ema_last = rsi30_ema[-1]
-    rsi_level_ok = rsi_last >= RSI_MIN
-    rsi_above_ema = rsi_last > rsi_ema_last
-
-    rsi_cross_ok = True
-    if REQUIRE_RSI_CROSS == 1:
-        n = min(len(rsi30_clean), len(rsi30_ema))
-        a = rsi30_clean[-n:]
-        b = rsi30_ema[-n:]
-        rsi_cross_ok = find_recent_cross_up(a, b, RSI_CROSS_LOOKBACK)
-
-    # ---- 5m trigger (EMA cross) + MACD
-    kl5 = get_klines(symbol, TF_TRIGGER_5M, KLINE_LIMIT)
-    _, _, _, _, c5, _ = parse_ohlcv(kl5)
-
-    e5_fast = ema(c5, EMA_FAST)
-    e5_slow = ema(c5, EMA_SLOW)
-    if not e5_fast or not e5_slow or len(e5_fast) < 3 or len(e5_slow) < 3:
-        return None
-    cross_5m_up = crossed_up(e5_fast[-2], e5_slow[-2], e5_fast[-1], e5_slow[-1])
-
-    macd_line, macd_sig, macd_hist = macd_last(c5)
-    macd_ok = True
-    macd_near0_ok = None
-    if USE_MACD_NEAR0 == 1:
-        macd_ok = (not math.isnan(macd_line)) and (abs(macd_line) <= MACD_NEAR0)
-        macd_near0_ok = macd_ok
-    else:
-        if MACD_POSITIVE == 1:
-            macd_ok = (not math.isnan(macd_line)) and (macd_line > 0)
-
-    ok = (
-        trend_1h and
-        trend_30m and
-        rsi_level_ok and
-        rsi_above_ema and
-        rsi_cross_ok and
-        cross_5m_up and
-        macd_ok
+        f"{BINANCE_FAPI}/fapi/v1/ticker/24hr"
     )
-    if not ok:
+
+    rows=[]
+
+    for x in data:
+
+        s=x["symbol"]
+
+        if not s.endswith("USDT"):
+            continue
+
+        vol=float(x["quoteVolume"])
+
+        if vol>=MIN_QUOTE_VOLUME:
+
+            rows.append(
+
+                (s,vol)
+
+            )
+
+    rows.sort(
+
+        key=lambda x:x[1],
+
+        reverse=True
+
+    )
+
+    return [x[0] for x in rows[:TOP_N]]
+
+
+# =========================
+# SIGNAL
+# =========================
+
+def check_signal(symbol):
+
+    kl5=get_klines(symbol,TF_5M,KLINE_LIMIT)
+
+    _,_,_,_,close5,_=parse_ohlcv(kl5)
+
+    ema_fast=ema(close5,EMA_FAST)
+    ema_slow=ema(close5,EMA_SLOW)
+
+    if len(ema_fast)<3:
         return None
 
-    entry = c5[-1]
-    sl = swing_low - (atr * ATR_MULT)
-    risk = entry - sl
-    if risk <= 0:
+    cross=crossed_up(
+
+        ema_fast[-2],
+        ema_slow[-2],
+
+        ema_fast[-1],
+        ema_slow[-1]
+    )
+
+    if not cross:
         return None
 
-    tp1 = entry + risk * TP_R1
-    tp2 = entry + risk * TP_R2
-    tp3 = entry + risk * TP_R3
+    return dict(
 
-    macd_hist_str = "nan" if math.isnan(macd_hist) else f"{macd_hist:+.8f}"
+        symbol=symbol,
 
-    return {
-        "symbol": symbol,
-        "tf": TF_TREND_1H,
-        "closed_time": closed_1h_time,
-        "entry": entry,
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "tp3": tp3,
-        "rsi": rsi_last,
-        "rsi_ema": rsi_ema_last,
-        "macd_hist": macd_hist,
-        "macd_hist_str": macd_hist_str,
-        "macd_near0_ok": macd_near0_ok,
-        "vol_ratio": vol_ratio,
-    }
+        price=close5[-1]
+
+    )
 
 
 # =========================
-# TELEGRAM FORMAT
+# MESSAGE
 # =========================
-def fmt(x: float) -> str:
-    if x == 0 or math.isnan(x) or math.isinf(x):
-        return "nan"
-    if abs(x) >= 1:
-        return f"{x:.4f}"
-    return f"{x:.6f}"
 
+def build_msg(sig):
 
-def build_signal_message(sig: Dict) -> str:
-    near0_mark = ""
-    if sig.get("macd_near0_ok") is True:
-        near0_mark = " ✅"
-    elif sig.get("macd_near0_ok") is False:
-        near0_mark = " ❌"
+    return f"""🚀 LONG SIGNAL
 
-    vol_line = ""
-    if sig.get("vol_ratio") is not None:
-        vol_line = f"Vol: {sig['vol_ratio']:.2f}x (vs SMA{VOL_LEN}, mult={VOL_MULT})"
+Symbol: {sig['symbol']}
 
-    msg = []
-    msg.append("🚀 LONG BREAKOUT (EMA3↑EMA44)")
-    msg.append(f"SYMBOL: {sig['symbol']}")
-    msg.append(f"TF: {sig['tf']}")
-    msg.append(f"Time (closed candle): {sig['closed_time']}")
-    msg.append("")
-    msg.append(f"ENTRY: {fmt(sig['entry'])}")
-    msg.append(f"SL:   {fmt(sig['sl'])}  (SwingLow-ATR)")
-    msg.append(f"TP1:  {fmt(sig['tp1'])}  (1R)")
-    msg.append(f"TP2:  {fmt(sig['tp2'])}  (2R)")
-    msg.append(f"TP3:  {fmt(sig['tp3'])}  (3R)")
-    msg.append("")
-    msg.append(f"RSI({RSI_LEN}): {sig['rsi']:.2f} (↑)")
-    msg.append(f"MACD hist: {sig['macd_hist_str']} (↑){near0_mark}")
-    if vol_line:
-        msg.append(vol_line)
-    msg.append("")
-    msg.append("Plan:")
-    msg.append("- TP1 görünce SL = ENTRY (break-even)")
-    msg.append("- Kapanış EMA44 altına inerse çık (trail)")
-    msg.append("")
-    msg.append("#scanner")
-    return "\n".join(msg)
+Price: {sig['price']}
+
+#scanner
+"""
 
 
 # =========================
-# MAIN
+# MAIN LOOP
 # =========================
+
 def main():
+
     storage = Storage(
+
         STORAGE_PATH,
+
         enabled=(USE_STORAGE == 1),
-        cooldown_sec=COOLDOWN_SEC,
+
+        cooldown_sec=COOLDOWN_SEC
+
     )
 
-    print("✅ futures-scanner started (BOT mode)")
-    print(f"TOP_N={TOP_N} MIN_QUOTE_VOLUME={MIN_QUOTE_VOLUME} INTERVAL_SEC={INTERVAL_SEC}")
-    print(f"EMA_FAST={EMA_FAST} EMA_SLOW={EMA_SLOW} | RSI_LEN={RSI_LEN} RSI_EMA_LEN={RSI_EMA_LEN} RSI_MIN={RSI_MIN}")
-    print(f"ATR_LEN={ATR_LEN} ATR_MULT={ATR_MULT} SWING_LEN={SWING_LEN} | TP: {TP_R1}/{TP_R2}/{TP_R3}R")
-    print(f"VOL_FILTER={USE_VOL_FILTER} VOL_LEN={VOL_LEN} VOL_MULT={VOL_MULT}")
-    print(f"USE_STORAGE={USE_STORAGE} COOLDOWN_SEC={COOLDOWN_SEC}")
-    print(f"MACD: USE_NEAR0={USE_MACD_NEAR0} NEAR0={MACD_NEAR0} POSITIVE={MACD_POSITIVE}")
-    print(f"BTC_FILTER={'ON' if USE_BTC_FILTER==1 else 'OFF'} BTC_RSI_MIN={BTC_RSI_MIN}")
+    print("BOT STARTED")
 
-    last_hb = time.time()
+    last_hb=time.time()
 
     while True:
+
         try:
-            if not btc_filter_ok():
-                if DEBUG:
-                    print("BTC filter: FAIL (skip cycle)")
-                time.sleep(INTERVAL_SEC)
-                continue
 
-            symbols = get_top_symbols_by_quote_volume(TOP_N, MIN_QUOTE_VOLUME)
+            symbols=get_symbols()
 
-            sent_count = 0
-            scanned = 0
+            sent=0
 
             for sym in symbols:
-                scanned += 1
-                try:
-                    sig = check_signal(sym)
-                    if not sig:
-                        continue
 
-                    key = f"{sym}:LONG_EMA_MTF_RSI123_ATR"
+                sig=check_signal(sym)
 
-                    if storage.can_send(key):
-                        text = build_signal_message(sig)
-                        if DEBUG:
-                            print(text)
-
-                        send_telegram(text)
-                        storage.mark_sent(key)
-                        sent_count += 1
-                        time.sleep(1)  # Telegram rate limit yumuşatma
-
-                except Exception as e:
-                    if DEBUG:
-                        print(f"scan error {sym}: {e}")
+                if not sig:
                     continue
 
-            if DEBUG:
-                print(f"candidates={len(symbols)} scanned={scanned} signals={sent_count}")
+                key=f"{sym}_LONG"
 
-            if HEARTBEAT_SEC > 0 and (time.time() - last_hb) >= HEARTBEAT_SEC:
-                hb = f"💓 HB | TF={TF_TREND_1H} | TOP_N={TOP_N} | MIN_QV={MIN_QUOTE_VOLUME} | BTC filter={'ON' if USE_BTC_FILTER==1 else 'OFF'} | signals={sent_count}"
-                if DEBUG:
-                    print(hb)
-                last_hb = time.time()
+                if storage.should_send(key):
+
+                    msg=build_msg(sig)
+
+                    send_telegram(msg)
+
+                    storage.mark_sent(key)
+
+                    print("SIGNAL SENT:",sym)
+
+                    sent+=1
+
+                    time.sleep(1)
+
+
+            if DEBUG:
+
+                print("Cycle done. Sent:",sent)
+
+            if time.time()-last_hb>HEARTBEAT_SEC:
+
+                print("HEARTBEAT OK")
+
+                last_hb=time.time()
+
 
         except Exception as e:
-            print(f"⚠️ main loop error: {e}")
+
+            print("ERROR:",e)
 
         time.sleep(INTERVAL_SEC)
 
 
-if __name__ == "__main__":
+# =========================
+
+if __name__=="__main__":
+
     main()
