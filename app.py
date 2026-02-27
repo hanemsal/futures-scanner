@@ -162,6 +162,7 @@ def main():
     )
 
     print("BOT STARTED")
+    print("STORAGE_PATH =", STORAGE_PATH)
 
     # Telegram test mesajı (1 kez denemek istersen yorumdan çıkar)
     # send_telegram("✅ futures-scanner test mesajı")
