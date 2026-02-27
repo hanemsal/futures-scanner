@@ -1,42 +1,75 @@
+# storage.py
 import json
 import os
 import time
-from typing import Dict, Any
+from typing import Any, Dict, Optional
+
 
 class Storage:
-    def __init__(self, path: str):
-        self.path = path
-        self.data: Dict[str, Any] = {}
-        self._load()
+    """
+    Basit JSON dosya storage.
+    - enabled: 1 ise aktif, 0 ise pasif (hiç yazmaz/okumaz)
+    - cooldown_sec: aynı sembolün tekrar sinyal vermesini engeller
+    """
+
+    def __init__(self, path: str, enabled: bool = True, cooldown_sec: int = 3600):
+        self.path = path or "state.json"
+        self.enabled = bool(enabled)
+        self.cooldown_sec = int(cooldown_sec) if cooldown_sec is not None else 3600
+        self._data: Dict[str, Any] = {"sent": {}}  # { symbol: last_ts }
+
+        if self.enabled:
+            self._load()
 
     def _load(self) -> None:
-        if not self.path:
-            self.data = {}
-            return
-        if not os.path.exists(self.path):
-            self.data = {}
-            return
         try:
-            with open(self.path, "r", encoding="utf-8") as f:
-                self.data = json.load(f)
+            if os.path.exists(self.path):
+                with open(self.path, "r", encoding="utf-8") as f:
+                    self._data = json.load(f) or {"sent": {}}
+            if "sent" not in self._data or not isinstance(self._data["sent"], dict):
+                self._data["sent"] = {}
         except Exception:
-            self.data = {}
+            # bozuk dosya vs -> sıfırla
+            self._data = {"sent": {}}
 
-    def save(self) -> None:
-        if not self.path:
+    def _save(self) -> None:
+        if not self.enabled:
             return
-        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         try:
+            # Render disk yazma izinleri için güvenli klasör
+            dir_name = os.path.dirname(self.path)
+            if dir_name:
+                os.makedirs(dir_name, exist_ok=True)
             with open(self.path, "w", encoding="utf-8") as f:
-                json.dump(self.data, f, ensure_ascii=False, indent=2)
+                json.dump(self._data, f, ensure_ascii=False, indent=2)
         except Exception:
+            # yazamazsa sessiz geç
             pass
 
-    def can_send(self, key: str, cooldown_sec: int) -> bool:
-        now = int(time.time())
-        last = int(self.data.get(key, 0) or 0)
-        return (now - last) >= cooldown_sec
+    def should_send(self, key: str, now_ts: Optional[int] = None) -> bool:
+        """
+        key: symbol gibi unique anahtar
+        cooldown süresi dolmadan tekrar gönderme.
+        """
+        if not self.enabled:
+            return True
 
-    def mark_sent(self, key: str) -> None:
-        self.data[key] = int(time.time())
-        self.save()
+        now = int(now_ts or time.time())
+        last = self._data.get("sent", {}).get(key)
+
+        if last is None:
+            return True
+
+        try:
+            last_i = int(last)
+        except Exception:
+            return True
+
+        return (now - last_i) >= self.cooldown_sec
+
+    def mark_sent(self, key: str, now_ts: Optional[int] = None) -> None:
+        if not self.enabled:
+            return
+        now = int(now_ts or time.time())
+        self._data.setdefault("sent", {})[key] = now
+        self._save()
