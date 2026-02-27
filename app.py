@@ -1,22 +1,20 @@
 import os
 import time
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 import requests
 
 from notify import send_telegram
 from storage import Storage
 
-
 # =========================
 # ENV
 # =========================
-
 BINANCE_FAPI = os.getenv("BINANCE_FAPI", "https://fapi.binance.com").rstrip("/")
 
 DEBUG = int(os.getenv("DEBUG", "1"))
 
-INTERVAL_SEC = int(os.getenv("INTERVAL_SEC", "300"))
+INTERVAL_SEC = int(os.getenv("INTERVAL_SEC", "180"))
 HEARTBEAT_SEC = int(os.getenv("HEARTBEAT_SEC", "900"))
 
 KLINE_LIMIT = int(os.getenv("KLINE_LIMIT", "260"))
@@ -27,29 +25,28 @@ MIN_QUOTE_VOLUME = float(os.getenv("MIN_QUOTE_VOLUME", "3000000"))
 EMA_FAST = int(os.getenv("EMA_FAST", "3"))
 EMA_SLOW = int(os.getenv("EMA_SLOW", "44"))
 
-TF = os.getenv("TF", "5m")
-HTF = os.getenv("HTF", "1h")
-
 USE_STORAGE = int(os.getenv("USE_STORAGE", "1"))
-STORAGE_PATH = os.getenv("STORAGE_PATH", "/var/data/futures_state.json")
+STORAGE_PATH = os.getenv("STORAGE_PATH", "/tmp/futures_state.json")
 COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "21600"))
 
+TF_ENTRY = os.getenv("TF_ENTRY", "5m")   # entry timeframe
+TF_TREND = os.getenv("TF_TREND", "1h")   # trend timeframe
+
 
 # =========================
-# HTTP
+# HTTP (retry'li)
 # =========================
-
-def get_json(url: str, params=None, retries=3, timeout=15):
-    last = None
+def get_json(url: str, params=None, retries: int = 3, timeout: int = 15):
+    last_err = None
     for i in range(retries):
         try:
             r = requests.get(url, params=params, timeout=timeout)
             r.raise_for_status()
             return r.json()
         except Exception as e:
-            last = e
-            time.sleep(i+1)
-    raise last
+            last_err = e
+            time.sleep(1.0 * (i + 1))
+    raise last_err
 
 
 def get_klines(symbol: str, tf: str, limit: int):
@@ -62,150 +59,134 @@ def get_klines(symbol: str, tf: str, limit: int):
 # =========================
 # PARSE
 # =========================
-
 def parse_close(klines) -> List[float]:
     return [float(x[4]) for x in klines]
 
 
 # =========================
-# EMA
+# INDICATORS
 # =========================
-
 def ema(data: List[float], length: int) -> List[float]:
+    if not data:
+        return []
+    if length <= 1:
+        return data[:]
 
     k = 2 / (length + 1)
-
     out = [data[0]]
-
     for i in range(1, len(data)):
-        out.append(data[i]*k + out[-1]*(1-k))
-
+        out.append(data[i] * k + out[-1] * (1 - k))
     return out
+
+
+def crossed_up(prev_a: float, prev_b: float, now_a: float, now_b: float) -> bool:
+    return prev_a <= prev_b and now_a > now_b
+
+
+def slope_up(series: List[float], bars: int = 2) -> bool:
+    """
+    Basit eğim kontrolü:
+    - bars=2 => son değer > bir önceki
+    - bars=3 => son değer > iki bar önce gibi daha güçlü yapılabilir
+    """
+    if len(series) < bars + 1:
+        return False
+    return series[-1] > series[-1 - bars]
 
 
 # =========================
 # SYMBOL LIST
 # =========================
-
 def get_symbols() -> List[str]:
-
     data = get_json(f"{BINANCE_FAPI}/fapi/v1/ticker/24hr")
-
     rows = []
 
     for x in data:
-
-        symbol = x["symbol"]
-
-        if not symbol.endswith("USDT"):
+        s = x.get("symbol", "")
+        if not s.endswith("USDT"):
             continue
 
-        vol = float(x["quoteVolume"])
+        try:
+            vol = float(x.get("quoteVolume", 0))
+        except Exception:
+            continue
 
         if vol >= MIN_QUOTE_VOLUME:
+            rows.append((s, vol))
 
-            rows.append((symbol, vol))
-
-    rows.sort(key=lambda x: x[1], reverse=True)
-
-    return [x[0] for x in rows[:TOP_N]]
+    rows.sort(key=lambda t: t[1], reverse=True)
+    return [s for s, _ in rows[:TOP_N]]
 
 
 # =========================
-# PROFESSIONAL SIGNAL ENGINE
+# TREND FILTER (1H)
 # =========================
+def trend_ok_long(symbol: str) -> bool:
+    kl = get_klines(symbol, TF_TREND, KLINE_LIMIT)
+    if len(kl) < 20:
+        return False
 
-def check_signal(symbol: str) -> Optional[Dict]:
-
-    need = EMA_SLOW + 10
-
-    # =====================
-    # 5m SIGNAL TF
-    # =====================
-
-    kl = get_klines(symbol, TF, KLINE_LIMIT)
-
-    kl = kl[:-1]  # last candle ignore
-
+    # kapanmayan son mum -> çıkar
+    kl = kl[:-1]
     close = parse_close(kl)
 
+    need = max(EMA_FAST, EMA_SLOW) + 5
+    if len(close) < need:
+        return False
+
+    ef = ema(close, EMA_FAST)
+    es = ema(close, EMA_SLOW)
+    if len(ef) < 5 or len(es) < 5:
+        return False
+
+    # KURAL (Seçenek 3):
+    # 1) EMA3 > EMA44
+    # 2) EMA3 slope > 0 (yukarı eğim)
+    if not (ef[-1] > es[-1]):
+        return False
+
+    if not slope_up(ef, bars=2):  # bars=2 iyi denge
+        return False
+
+    return True
+
+
+# =========================
+# ENTRY SIGNAL (5M cross)
+# =========================
+def check_entry_long(symbol: str) -> Optional[Dict]:
+    kl = get_klines(symbol, TF_ENTRY, KLINE_LIMIT)
+    if len(kl) < 20:
+        return None
+
+    # kapanmayan son mum -> çıkar
+    kl = kl[:-1]
+    close = parse_close(kl)
+
+    need = max(EMA_FAST, EMA_SLOW) + 5
     if len(close) < need:
         return None
 
-    ema_fast = ema(close, EMA_FAST)
-    ema_slow = ema(close, EMA_SLOW)
-
-
-    # =====================
-    # 2 candle confirmation
-    # =====================
-
-    if not (
-        ema_fast[-3] <= ema_slow[-3]
-        and ema_fast[-2] > ema_slow[-2]
-        and ema_fast[-1] > ema_slow[-1]
-    ):
+    ef = ema(close, EMA_FAST)
+    es = ema(close, EMA_SLOW)
+    if len(ef) < 3 or len(es) < 3:
         return None
 
-
-    # =====================
-    # DISTANCE FILTER
-    # =====================
-
-    distance = (ema_fast[-1] - ema_slow[-1]) / ema_slow[-1]
-
-    if distance < 0.0015:
+    cross = crossed_up(ef[-2], es[-2], ef[-1], es[-1])
+    if not cross:
         return None
 
-
-    # =====================
-    # HTF FILTER (1H)
-    # =====================
-
-    hkl = get_klines(symbol, HTF, KLINE_LIMIT)
-
-    hkl = hkl[:-1]
-
-    hclose = parse_close(hkl)
-
-    if len(hclose) < need:
-        return None
-
-    h_fast = ema(hclose, EMA_FAST)
-    h_slow = ema(hclose, EMA_SLOW)
-
-
-    # Trend direction filter
-    if h_fast[-1] <= h_slow[-1]:
-        return None
-
-
-    # =====================
-    # SLOPE FILTER ⭐⭐⭐⭐⭐
-    # =====================
-
-    if h_slow[-1] <= h_slow[-4]:
-        return None
-
-
-    return {
-        "symbol": symbol,
-        "price": close[-1],
-        "tf": TF,
-        "htf": HTF
-    }
+    return {"symbol": symbol, "price": close[-1]}
 
 
 # =========================
 # MESSAGE
 # =========================
-
-def build_msg(sig):
-
+def build_msg_long(sig: Dict) -> str:
     return (
         "🚀 LONG SIGNAL\n\n"
         f"Symbol: {sig['symbol']}\n"
-        f"TF: {sig['tf']} | HTF: {sig['htf']}\n"
+        f"TF: {TF_ENTRY} | HTF: {TF_TREND}\n"
         f"Price: {sig['price']}\n\n"
         "#scanner"
     )
@@ -214,9 +195,7 @@ def build_msg(sig):
 # =========================
 # MAIN LOOP
 # =========================
-
 def main():
-
     storage = Storage(
         STORAGE_PATH,
         enabled=(USE_STORAGE == 1),
@@ -224,65 +203,56 @@ def main():
     )
 
     print("BOT STARTED")
-    print("Professional Institutional Version Active")
-
+    print("STORAGE_PATH =", STORAGE_PATH)
+    print("TF_ENTRY =", TF_ENTRY, "| TF_TREND =", TF_TREND)
+    print("COOLDOWN_SEC =", COOLDOWN_SEC)
 
     last_hb = time.time()
 
-
     while True:
-
         sent = 0
-
         try:
-
             symbols = get_symbols()
+            if DEBUG:
+                print(f"Symbols loaded: {len(symbols)}")
 
             for sym in symbols:
+                try:
+                    # 1) 1h trend filtresi (zorunlu)
+                    if not trend_ok_long(sym):
+                        continue
 
-                sig = check_signal(sym)
+                    # 2) 5m entry cross
+                    sig = check_entry_long(sym)
+                    if not sig:
+                        continue
 
-                if not sig:
-                    continue
+                    key = f"{sym}_LONG_{TF_ENTRY}_HTF_{TF_TREND}"
 
-                key = f"{sym}_LONG"
+                    if storage.should_send(key):
+                        msg = build_msg_long(sig)
+                        send_telegram(msg)
+                        storage.mark_sent(key)
+                        print("SIGNAL SENT:", sym)
+                        sent += 1
+                        time.sleep(0.4)
 
-                if storage.should_send(key):
-
-                    msg = build_msg(sig)
-
-                    send_telegram(msg)
-
-                    storage.mark_sent(key)
-
-                    print("SIGNAL SENT:", sym)
-
-                    sent += 1
-
-                    time.sleep(0.5)
-
+                except Exception as e:
+                    if DEBUG:
+                        print(f"SYM ERROR {sym}: {e}")
 
             if DEBUG:
                 print("Cycle done. Sent:", sent)
 
-
             if time.time() - last_hb > HEARTBEAT_SEC:
-
                 print("HEARTBEAT OK")
-
                 last_hb = time.time()
 
-
         except Exception as e:
-
-            print("ERROR:", e)
-
+            print("ERROR (main loop):", e)
 
         time.sleep(INTERVAL_SEC)
 
-
-
-# =========================
 
 if __name__ == "__main__":
     main()
