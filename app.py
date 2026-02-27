@@ -1,8 +1,6 @@
 import os
 import time
-import math
-from datetime import datetime, timezone
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Optional
 
 import requests
 
@@ -13,13 +11,12 @@ from storage import Storage
 # =========================
 # ENV
 # =========================
-
 BINANCE_FAPI = os.getenv("BINANCE_FAPI", "https://fapi.binance.com").rstrip("/")
 
 DEBUG = int(os.getenv("DEBUG", "1"))
 
-INTERVAL_SEC = int(os.getenv("INTERVAL_SEC", "60"))
-HEARTBEAT_SEC = int(os.getenv("HEARTBEAT_SEC", "600"))
+INTERVAL_SEC = int(os.getenv("INTERVAL_SEC", "300"))
+HEARTBEAT_SEC = int(os.getenv("HEARTBEAT_SEC", "900"))
 
 KLINE_LIMIT = int(os.getenv("KLINE_LIMIT", "260"))
 
@@ -29,285 +26,180 @@ MIN_QUOTE_VOLUME = float(os.getenv("MIN_QUOTE_VOLUME", "3000000"))
 EMA_FAST = int(os.getenv("EMA_FAST", "3"))
 EMA_SLOW = int(os.getenv("EMA_SLOW", "44"))
 
-RSI_LEN = int(os.getenv("RSI_LEN", "123"))
-RSI_EMA_LEN = int(os.getenv("RSI_EMA_LEN", "47"))
-RSI_MIN = float(os.getenv("RSI_MIN", "50"))
-
 USE_STORAGE = int(os.getenv("USE_STORAGE", "1"))
-STORAGE_PATH = os.getenv("STORAGE_PATH", "/tmp/futures_storage.json")
+# Render'da disk yoksa /tmp iyi; disk bağladıysan /var/data/... kullan
+STORAGE_PATH = os.getenv("STORAGE_PATH", "/tmp/futures_state.json")
 COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "3600"))
 
-TF_1H = "1h"
-TF_30M = "30m"
 TF_5M = "5m"
 
 
 # =========================
-# HTTP
+# HTTP (retry'li)
 # =========================
+def get_json(url: str, params=None, retries: int = 3, timeout: int = 15):
+    last_err = None
+    for i in range(retries):
+        try:
+            r = requests.get(url, params=params, timeout=timeout)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_err = e
+            time.sleep(1.0 * (i + 1))
+    raise last_err
 
-def get_json(url: str, params=None):
 
-    r = requests.get(url, params=params, timeout=20)
-    r.raise_for_status()
-    return r.json()
-
-
-def get_klines(symbol, tf, limit):
-
+def get_klines(symbol: str, tf: str, limit: int):
     return get_json(
-
         f"{BINANCE_FAPI}/fapi/v1/klines",
-
-        params=dict(
-
-            symbol=symbol,
-
-            interval=tf,
-
-            limit=limit
-
-        )
-
+        params={"symbol": symbol, "interval": tf, "limit": limit},
     )
 
 
 # =========================
 # PARSE
 # =========================
-
-def parse_ohlcv(kl):
-
-    close_time = [int(x[6]) for x in kl]
-
-    open = [float(x[1]) for x in kl]
-    high = [float(x[2]) for x in kl]
-    low = [float(x[3]) for x in kl]
-    close = [float(x[4]) for x in kl]
-    vol = [float(x[5]) for x in kl]
-
-    return close_time, open, high, low, close, vol
+def parse_close(klines):
+    # klines format: [ [open_time, open, high, low, close, volume, close_time, ...], ... ]
+    closes = [float(x[4]) for x in klines]
+    return closes
 
 
 # =========================
 # INDICATORS
 # =========================
-
-def ema(data, length):
-
-    k = 2/(length+1)
-
-    out=[data[0]]
-
-    for i in range(1,len(data)):
-
-        out.append(
-
-            data[i]*k + out[-1]*(1-k)
-
-        )
-
+def ema(data, length: int):
+    if length <= 1:
+        return data[:]
+    k = 2 / (length + 1)
+    out = [data[0]]
+    for i in range(1, len(data)):
+        out.append(data[i] * k + out[-1] * (1 - k))
     return out
 
 
 def crossed_up(prev_a, prev_b, now_a, now_b):
-
     return prev_a <= prev_b and now_a > now_b
-
-
-def rsi(data, length):
-
-    rsis=[None]*len(data)
-
-    for i in range(length,len(data)):
-
-        gain=0
-        loss=0
-
-        for j in range(i-length+1,i+1):
-
-            diff=data[j]-data[j-1]
-
-            if diff>=0:
-                gain+=diff
-            else:
-                loss+=abs(diff)
-
-        if loss==0:
-            rsis[i]=100
-        else:
-            rs=gain/loss
-            rsis[i]=100-(100/(1+rs))
-
-    return rsis
 
 
 # =========================
 # SYMBOL LIST
 # =========================
-
-def get_symbols():
-
-    data=get_json(
-
-        f"{BINANCE_FAPI}/fapi/v1/ticker/24hr"
-    )
-
-    rows=[]
-
+def get_symbols() -> List[str]:
+    data = get_json(f"{BINANCE_FAPI}/fapi/v1/ticker/24hr")
+    rows = []
     for x in data:
-
-        s=x["symbol"]
-
+        s = x.get("symbol", "")
         if not s.endswith("USDT"):
             continue
+        # İstersen stable’ları temizleyebilirsin:
+        # if s in ("BUSDUSDT", "USDCUSDT", "TUSDUSDT"): continue
 
-        vol=float(x["quoteVolume"])
+        try:
+            vol = float(x.get("quoteVolume", 0))
+        except Exception:
+            continue
 
-        if vol>=MIN_QUOTE_VOLUME:
+        if vol >= MIN_QUOTE_VOLUME:
+            rows.append((s, vol))
 
-            rows.append(
-
-                (s,vol)
-
-            )
-
-    rows.sort(
-
-        key=lambda x:x[1],
-
-        reverse=True
-
-    )
-
-    return [x[0] for x in rows[:TOP_N]]
+    rows.sort(key=lambda t: t[1], reverse=True)
+    return [s for s, _ in rows[:TOP_N]]
 
 
 # =========================
 # SIGNAL
 # =========================
+def check_signal(symbol: str) -> Optional[Dict]:
+    kl = get_klines(symbol, TF_5M, KLINE_LIMIT)
 
-def check_signal(symbol):
+    # En kritik stabilizasyon: son mum kapanmamış olabilir → çıkar
+    if len(kl) < 5:
+        return None
+    kl = kl[:-1]
 
-    kl5=get_klines(symbol,TF_5M,KLINE_LIMIT)
-
-    _,_,_,_,close5,_=parse_ohlcv(kl5)
-
-    ema_fast=ema(close5,EMA_FAST)
-    ema_slow=ema(close5,EMA_SLOW)
-
-    if len(ema_fast)<3:
+    close = parse_close(kl)
+    if len(close) < max(EMA_FAST, EMA_SLOW) + 3:
         return None
 
-    cross=crossed_up(
+    ema_fast = ema(close, EMA_FAST)
+    ema_slow = ema(close, EMA_SLOW)
 
-        ema_fast[-2],
-        ema_slow[-2],
-
-        ema_fast[-1],
-        ema_slow[-1]
+    cross = crossed_up(
+        ema_fast[-2], ema_slow[-2],
+        ema_fast[-1], ema_slow[-1]
     )
-
     if not cross:
         return None
 
-    return dict(
-
-        symbol=symbol,
-
-        price=close5[-1]
-
-    )
+    return {"symbol": symbol, "price": close[-1]}
 
 
 # =========================
 # MESSAGE
 # =========================
-
-def build_msg(sig):
-
-    return f"""🚀 LONG SIGNAL
-
-Symbol: {sig['symbol']}
-
-Price: {sig['price']}
-
-#scanner
-"""
+def build_msg(sig: Dict) -> str:
+    return (
+        "🚀 LONG SIGNAL\n\n"
+        f"Symbol: {sig['symbol']}\n"
+        f"Price: {sig['price']}\n\n"
+        "#scanner"
+    )
 
 
 # =========================
 # MAIN LOOP
 # =========================
-
 def main():
-
     storage = Storage(
-
         STORAGE_PATH,
-
         enabled=(USE_STORAGE == 1),
-
         cooldown_sec=COOLDOWN_SEC
-
     )
 
     print("BOT STARTED")
-
-    last_hb=time.time()
+    last_hb = time.time()
 
     while True:
-
+        sent = 0
         try:
-
-            symbols=get_symbols()
-
-            sent=0
+            symbols = get_symbols()
+            if DEBUG:
+                print(f"Symbols loaded: {len(symbols)}")
 
             for sym in symbols:
+                try:
+                    sig = check_signal(sym)
+                    if not sig:
+                        continue
 
-                sig=check_signal(sym)
+                    key = f"{sym}_LONG_{TF_5M}"
 
-                if not sig:
-                    continue
+                    if storage.should_send(key):
+                        msg = build_msg(sig)
+                        send_telegram(msg)
+                        storage.mark_sent(key)
+                        print("SIGNAL SENT:", sym)
+                        sent += 1
 
-                key=f"{sym}_LONG"
-
-                if storage.should_send(key):
-
-                    msg=build_msg(sig)
-
-                    send_telegram(msg)
-
-                    storage.mark_sent(key)
-
-                    print("SIGNAL SENT:",sym)
-
-                    sent+=1
-
-                    time.sleep(1)
-
+                        time.sleep(0.5)  # Telegram spam koruması
+                except Exception as e:
+                    if DEBUG:
+                        print(f"SYM ERROR {sym}: {e}")
 
             if DEBUG:
+                print("Cycle done. Sent:", sent)
 
-                print("Cycle done. Sent:",sent)
-
-            if time.time()-last_hb>HEARTBEAT_SEC:
-
+            if time.time() - last_hb > HEARTBEAT_SEC:
                 print("HEARTBEAT OK")
-
-                last_hb=time.time()
-
+                last_hb = time.time()
 
         except Exception as e:
-
-            print("ERROR:",e)
+            print("ERROR (main loop):", e)
 
         time.sleep(INTERVAL_SEC)
 
 
-# =========================
-
-if __name__=="__main__":
-
+if __name__ == "__main__":
     main()
