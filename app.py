@@ -25,11 +25,14 @@ MIN_QUOTE_VOLUME = float(os.getenv("MIN_QUOTE_VOLUME", "3000000"))
 EMA_FAST = int(os.getenv("EMA_FAST", "3"))
 EMA_SLOW = int(os.getenv("EMA_SLOW", "44"))
 
+# Signal TF ve HTF Filter
+TF = os.getenv("TF", "5m").strip()            # sinyal timeframe (default 5m)
+HTF = os.getenv("HTF", "1h").strip()          # trend timeframe (default 1h)
+USE_HTF_FILTER = int(os.getenv("USE_HTF_FILTER", "1"))  # 1: aktif, 0: kapalı
+
 USE_STORAGE = int(os.getenv("USE_STORAGE", "1"))
 STORAGE_PATH = os.getenv("STORAGE_PATH", "/tmp/futures_state.json")
 COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "3600"))
-
-TF_5M = "5m"
 
 
 # =========================
@@ -107,19 +110,20 @@ def get_symbols() -> List[str]:
 
 
 # =========================
-# SIGNAL
+# SIGNAL (Seçenek B: TF sinyal + HTF trend filtresi)
 # =========================
 def check_signal(symbol: str) -> Optional[Dict]:
-    kl = get_klines(symbol, TF_5M, KLINE_LIMIT)
+    need = max(EMA_FAST, EMA_SLOW) + 5
 
+    # ---- 1) Signal TF (default: 5m)
+    kl = get_klines(symbol, TF, KLINE_LIMIT)
     if len(kl) < 10:
         return None
 
-    # Son mum kapanmamış olabilir -> çıkar (fake sinyal azaltır)
+    # Son mum kapanmamış olabilir -> çıkar
     kl = kl[:-1]
 
     close = parse_close(kl)
-    need = max(EMA_FAST, EMA_SLOW) + 5
     if len(close) < need:
         return None
 
@@ -136,7 +140,25 @@ def check_signal(symbol: str) -> Optional[Dict]:
     if not cross:
         return None
 
-    return {"symbol": symbol, "price": close[-1]}
+    # ---- 2) HTF Filter (default: 1h) -> trend onayı
+    if USE_HTF_FILTER == 1:
+        hkl = get_klines(symbol, HTF, KLINE_LIMIT)
+        if len(hkl) < 10:
+            return None
+
+        hkl = hkl[:-1]
+        hclose = parse_close(hkl)
+        if len(hclose) < need:
+            return None
+
+        h_fast = ema(hclose, EMA_FAST)
+        h_slow = ema(hclose, EMA_SLOW)
+
+        # LONG için: HTF'de fast > slow olmalı
+        if not (h_fast[-1] > h_slow[-1]):
+            return None
+
+    return {"symbol": symbol, "price": close[-1], "tf": TF, "htf": HTF}
 
 
 # =========================
@@ -146,6 +168,7 @@ def build_msg(sig: Dict) -> str:
     return (
         "🚀 LONG SIGNAL\n\n"
         f"Symbol: {sig['symbol']}\n"
+        f"TF: {sig.get('tf', '')} | HTF: {sig.get('htf', '')}\n"
         f"Price: {sig['price']}\n\n"
         "#scanner"
     )
@@ -163,9 +186,7 @@ def main():
 
     print("BOT STARTED")
     print("STORAGE_PATH =", STORAGE_PATH)
-
-    # Telegram test mesajı (1 kez denemek istersen yorumdan çıkar)
-    # send_telegram("✅ futures-scanner test mesajı")
+    print("TF =", TF, "| HTF =", HTF, "| USE_HTF_FILTER =", USE_HTF_FILTER)
 
     last_hb = time.time()
 
@@ -182,7 +203,7 @@ def main():
                     if not sig:
                         continue
 
-                    key = f"{sym}_LONG_{TF_5M}"
+                    key = f"{sym}_LONG_{TF}_HTF{HTF}"
 
                     if storage.should_send(key):
                         msg = build_msg(sig)
