@@ -7,7 +7,6 @@ TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
 
 def send_telegram(text: str) -> None:
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        # Token/chat yoksa sessiz geç (Render log’da görürsün)
         print("⚠️ Telegram credentials missing (TG_BOT_TOKEN / TG_CHAT_ID).")
         return
 
@@ -17,5 +16,13 @@ def send_telegram(text: str) -> None:
         "text": text,
         "disable_web_page_preview": True,
     }
+
     r = requests.post(url, data=payload, timeout=20)
-    r.raise_for_status()
+
+    # Debug için response görünsün
+    if r.status_code != 200:
+        print("❌ Telegram error:", r.status_code, r.text)
+        r.raise_for_status()
+    else:
+        # İstersen DEBUG env ile açarız, şimdilik sade
+        print("✅ Telegram sent")
