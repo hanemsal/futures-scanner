@@ -1,16 +1,21 @@
+import os
 import requests
 
-def send_telegram(bot_token: str, chat_id: str, text: str, timeout: int = 20) -> None:
-    if not bot_token or not chat_id or not text:
+TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
+TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
+
+
+def send_telegram(text: str) -> None:
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        # Token/chat yoksa sessiz geç (Render log’da görürsün)
+        print("⚠️ Telegram credentials missing (TG_BOT_TOKEN / TG_CHAT_ID).")
         return
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     payload = {
-        "chat_id": chat_id,
+        "chat_id": TG_CHAT_ID,
         "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
+        "disable_web_page_preview": True,
     }
-    try:
-        requests.post(url, json=payload, timeout=timeout)
-    except Exception:
-        pass
+    r = requests.post(url, data=payload, timeout=20)
+    r.raise_for_status()
