@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional
 class Storage:
     """
     Basit JSON dosya storage.
+    - enabled: True ise aktif
     - cooldown_sec: aynı key'in tekrar sinyal vermesini engeller
     """
 
@@ -42,7 +43,6 @@ class Storage:
             pass
 
     def should_send(self, key: str, now_ts: Optional[int] = None) -> bool:
-        """cooldown dolduysa True"""
         if not self.enabled:
             return True
 
