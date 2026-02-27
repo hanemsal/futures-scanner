@@ -81,10 +81,6 @@ def ema(data: List[float], length: int) -> List[float]:
     return out
 
 
-def crossed_up(prev_a: float, prev_b: float, now_a: float, now_b: float) -> bool:
-    return prev_a <= prev_b and now_a > now_b
-
-
 # =========================
 # SYMBOL LIST
 # =========================
@@ -110,14 +106,14 @@ def get_symbols() -> List[str]:
 
 
 # =========================
-# SIGNAL (Seçenek B: TF sinyal + HTF trend filtresi)
+# SIGNAL (Seçenek B + 2 mum confirmation)
 # =========================
 def check_signal(symbol: str) -> Optional[Dict]:
-    need = max(EMA_FAST, EMA_SLOW) + 5
+    need = max(EMA_FAST, EMA_SLOW) + 6  # 2 mum confirmation için bir tık daha pay
 
     # ---- 1) Signal TF (default: 5m)
     kl = get_klines(symbol, TF, KLINE_LIMIT)
-    if len(kl) < 10:
+    if len(kl) < 12:
         return None
 
     # Son mum kapanmamış olabilir -> çıkar
@@ -130,20 +126,24 @@ def check_signal(symbol: str) -> Optional[Dict]:
     ema_fast = ema(close, EMA_FAST)
     ema_slow = ema(close, EMA_SLOW)
 
-    if len(ema_fast) < 3 or len(ema_slow) < 3:
+    if len(ema_fast) < 4 or len(ema_slow) < 4:
         return None
 
-    cross = crossed_up(
-        ema_fast[-2], ema_slow[-2],
-        ema_fast[-1], ema_slow[-1]
-    )
-    if not cross:
+    # ✅ 2 Mum Confirmation (kesişim + 1 mum devam)
+    # -3'te fast <= slow (kesişim öncesi)
+    # -2'de fast > slow  (kesişim olmuş)
+    # -1'de fast > slow  (trend devam etmiş)
+    if not (
+        ema_fast[-3] <= ema_slow[-3] and
+        ema_fast[-2] > ema_slow[-2] and
+        ema_fast[-1] > ema_slow[-1]
+    ):
         return None
 
     # ---- 2) HTF Filter (default: 1h) -> trend onayı
     if USE_HTF_FILTER == 1:
         hkl = get_klines(symbol, HTF, KLINE_LIMIT)
-        if len(hkl) < 10:
+        if len(hkl) < 12:
             return None
 
         hkl = hkl[:-1]
