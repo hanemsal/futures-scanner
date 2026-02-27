@@ -7,7 +7,6 @@ import requests
 from notify import send_telegram
 from storage import Storage
 
-
 # =========================
 # ENV
 # =========================
@@ -27,7 +26,6 @@ EMA_FAST = int(os.getenv("EMA_FAST", "3"))
 EMA_SLOW = int(os.getenv("EMA_SLOW", "44"))
 
 USE_STORAGE = int(os.getenv("USE_STORAGE", "1"))
-# Render'da disk yoksa /tmp iyi; disk bağladıysan /var/data/... kullan
 STORAGE_PATH = os.getenv("STORAGE_PATH", "/tmp/futures_state.json")
 COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "3600"))
 
@@ -60,18 +58,19 @@ def get_klines(symbol: str, tf: str, limit: int):
 # =========================
 # PARSE
 # =========================
-def parse_close(klines):
-    # klines format: [ [open_time, open, high, low, close, volume, close_time, ...], ... ]
-    closes = [float(x[4]) for x in klines]
-    return closes
+def parse_close(klines) -> List[float]:
+    return [float(x[4]) for x in klines]
 
 
 # =========================
 # INDICATORS
 # =========================
-def ema(data, length: int):
+def ema(data: List[float], length: int) -> List[float]:
+    if not data:
+        return []
     if length <= 1:
         return data[:]
+
     k = 2 / (length + 1)
     out = [data[0]]
     for i in range(1, len(data)):
@@ -79,7 +78,7 @@ def ema(data, length: int):
     return out
 
 
-def crossed_up(prev_a, prev_b, now_a, now_b):
+def crossed_up(prev_a: float, prev_b: float, now_a: float, now_b: float) -> bool:
     return prev_a <= prev_b and now_a > now_b
 
 
@@ -89,12 +88,11 @@ def crossed_up(prev_a, prev_b, now_a, now_b):
 def get_symbols() -> List[str]:
     data = get_json(f"{BINANCE_FAPI}/fapi/v1/ticker/24hr")
     rows = []
+
     for x in data:
         s = x.get("symbol", "")
         if not s.endswith("USDT"):
             continue
-        # İstersen stable’ları temizleyebilirsin:
-        # if s in ("BUSDUSDT", "USDCUSDT", "TUSDUSDT"): continue
 
         try:
             vol = float(x.get("quoteVolume", 0))
@@ -114,17 +112,22 @@ def get_symbols() -> List[str]:
 def check_signal(symbol: str) -> Optional[Dict]:
     kl = get_klines(symbol, TF_5M, KLINE_LIMIT)
 
-    # En kritik stabilizasyon: son mum kapanmamış olabilir → çıkar
-    if len(kl) < 5:
+    if len(kl) < 10:
         return None
+
+    # Son mum kapanmamış olabilir -> çıkar (fake sinyal azaltır)
     kl = kl[:-1]
 
     close = parse_close(kl)
-    if len(close) < max(EMA_FAST, EMA_SLOW) + 3:
+    need = max(EMA_FAST, EMA_SLOW) + 5
+    if len(close) < need:
         return None
 
     ema_fast = ema(close, EMA_FAST)
     ema_slow = ema(close, EMA_SLOW)
+
+    if len(ema_fast) < 3 or len(ema_slow) < 3:
+        return None
 
     cross = crossed_up(
         ema_fast[-2], ema_slow[-2],
@@ -158,13 +161,14 @@ def main():
         cooldown_sec=COOLDOWN_SEC
     )
 
- print("BOT STARTED")
+    print("BOT STARTED")
 
-send_telegram("✅ futures-scanner test mesajı")
+    # Telegram test mesajı (1 kez denemek istersen yorumdan çıkar)
+    # send_telegram("✅ futures-scanner test mesajı")
 
-last_hb = time.time()
+    last_hb = time.time()
 
-while True:
+    while True:
         sent = 0
         try:
             symbols = get_symbols()
@@ -185,8 +189,8 @@ while True:
                         storage.mark_sent(key)
                         print("SIGNAL SENT:", sym)
                         sent += 1
+                        time.sleep(0.5)
 
-                        time.sleep(0.5)  # Telegram spam koruması
                 except Exception as e:
                     if DEBUG:
                         print(f"SYM ERROR {sym}: {e}")
