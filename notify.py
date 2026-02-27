@@ -19,10 +19,8 @@ def send_telegram(text: str) -> None:
 
     r = requests.post(url, data=payload, timeout=20)
 
-    # Debug için response görünsün
     if r.status_code != 200:
         print("❌ Telegram error:", r.status_code, r.text)
         r.raise_for_status()
     else:
-        # İstersen DEBUG env ile açarız, şimdilik sade
         print("✅ Telegram sent")
