@@ -390,7 +390,17 @@ def build_signal_message(sig: Dict) -> str:
 # MAIN
 # =========================
 def main():
-    storage = Storage(STORAGE_PATH, enabled=(USE_STORAGE == 1), cooldown_sec=COOLDOWN_SEC)
+    # Storage / cooldown wrapper (enabled param yoksa böyle çöz)
+storage = Storage(STORAGE_PATH, cooldown_sec=COOLDOWN_SEC)
+
+def can_send(key: str) -> bool:
+    if USE_STORAGE == 1:
+        return storage.can_send(key)
+    return True
+
+def mark_sent(key: str):
+    if USE_STORAGE == 1:
+        storage.mark_sent(key)
 
     print("✅ futures-scanner started (BOT mode)")
     print(f"TOP_N={TOP_N} MIN_QUOTE_VOLUME={MIN_QUOTE_VOLUME} INTERVAL_SEC={INTERVAL_SEC}")
@@ -421,12 +431,12 @@ def main():
                         continue
 
                     key = f"{sym}:LONG_EMA_MTF_RSI123_ATR"
-                    if storage.can_send(key):
+                   if can_send(key):
                         text = build_signal_message(sig)
                         if DEBUG:
                             print(text)
                         send_telegram(text)
-                        storage.mark_sent(key)
+                         mark_sent(key)
                         sent_count += 1
                         time.sleep(1)  # telegram rate limit yumuşatma
                 except Exception:
@@ -435,11 +445,10 @@ def main():
             if DEBUG:
                 print(f"candidates={len(symbols)} scanned={scanned} signals={sent_count}")
 
-            if HEARTBEAT_SEC > 0 and (time.time() - last_hb) >= HEARTBEAT_SEC:
-                hb = f"💓 HB | TF={TF_TREND_1H} | TOP_N={TOP_N} | MIN_QV={MIN_QUOTE_VOLUME} | BTC filter={'ON' if USE_BTC_FILTER==1 else 'OFF'}"
-                if DEBUG:
-                    print(hb)
-                last_hb = time.time()
+           if HEARTBEAT_SEC > 0 and (time.time() - last_hb) >= HEARTBEAT_SEC:
+    hb = f"💓 HB | TF={TF_TREND_1H} | TOP_N={TOP_N} | MIN_QV={MIN_QUOTE_VOLUME} | BTC filter={'ON' if USE_BTC_FILTER==1 else 'OFF'}"
+    print(hb)  # DEBUG'e bağlı olmasın
+    last_hb = time.time()
 
         except Exception as e:
             print(f"⚠️ main loop error: {e}")
