@@ -11,6 +11,7 @@ from storage import Storage
 
 # ============================================================
 # Futures Scanner (EMA cross + filters) + MFI filter + REJECT DEBUG
+# + NET DEBUG ENTEGRASYONU (heartbeat / dry-run / test-once)
 # ============================================================
 
 BINANCE_FAPI = os.getenv("BINANCE_FAPI", "https://fapi.binance.com").rstrip("/")
@@ -54,7 +55,7 @@ RSI_LEN = int(os.getenv("RSI_LEN", "123"))
 RSI_EMA_LEN = int(os.getenv("RSI_EMA_LEN", "47"))
 RSI_MIN = float(os.getenv("RSI_MIN", "50"))
 
-# --- MFI filter (NEW)
+# --- MFI filter
 USE_MFI_FILTER = int(os.getenv("USE_MFI_FILTER", "1"))
 MFI_LEN = int(os.getenv("MFI_LEN", "14"))
 MFI_LONG_MIN = float(os.getenv("MFI_LONG_MIN", "50"))
@@ -75,10 +76,15 @@ COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "21600"))
 USE_STORAGE = int(os.getenv("USE_STORAGE", "1"))
 STORAGE_PATH = os.getenv("STORAGE_PATH", "/var/data/futures_state.json")
 
-# --- Debug
+# --- Debug / health
 DEBUG = int(os.getenv("DEBUG", "1"))
-DEBUG_REJECTS = int(os.getenv("DEBUG_REJECTS", "1"))  # NEW: 1=print reject reasons
+DEBUG_REJECTS = int(os.getenv("DEBUG_REJECTS", "1"))  # 1=print reject reasons
 HEARTBEAT_SEC = int(os.getenv("HEARTBEAT_SEC", "900"))
+
+# --- NEW: test switches (çalışıyor mu teyidi)
+DRY_RUN = int(os.getenv("DRY_RUN", "0"))          # 1 => telegrama gondermez, log basar
+TEST_ONCE = int(os.getenv("TEST_ONCE", "0"))      # 1 => tek tur scan yapar ve cikar
+DEBUG_EVERY_N = int(os.getenv("DEBUG_EVERY_N", "0"))  # 50 gibi => her N symbol'de progress log
 
 storage = Storage(STORAGE_PATH) if USE_STORAGE else None
 
@@ -230,7 +236,7 @@ def btc_ok() -> bool:
     except Exception as e:
         if DEBUG:
             print("BTC filter error:", e)
-        return True
+        return True  # hata olursa filtreyi fail yapmayalım
 
 def vol_ok(volume: List[float]) -> bool:
     if not USE_VOL_FILTER:
@@ -297,7 +303,7 @@ def htf_confirm(symbol: str, direction: str) -> bool:
     except Exception as e:
         if DEBUG:
             print("HTF confirm error:", symbol, e)
-        return True
+        return True  # hata olursa filtreyi fail yapmayalım
 
 
 # ============================================================
@@ -331,7 +337,7 @@ def build_message(symbol: str, direction: str, price: float, mfi_value: float = 
 
 
 # ============================================================
-# NEW: Debug reject reasons
+# Debug reject reasons
 # ============================================================
 
 def reject_log(symbol: str, direction: str, reasons: List[str]):
@@ -348,7 +354,7 @@ def evaluate_filters(symbol: str, direction: str, high: List[float], low: List[f
     if not htf_confirm(symbol, direction):
         reasons.append("HTF_CONFIRM_FAIL")
 
-    # BTC
+    # BTC (sadece LONG tarafinda)
     if direction == "LONG" and USE_BTC_FILTER and not btc_ok():
         reasons.append("BTC_FILTER_FAIL")
 
@@ -396,7 +402,7 @@ def entry_cross(symbol: str) -> Optional[Tuple[str, float, float]]:
     ef = ema(close, EMA_FAST)
     es = ema(close, EMA_SLOW)
 
-    # last completed bar
+    # last completed bar (bar kapanisi)
     a1, b1 = ef[-3], es[-3]
     a2, b2 = ef[-2], es[-2]
 
@@ -417,7 +423,7 @@ def entry_cross(symbol: str) -> Optional[Tuple[str, float, float]]:
 
 
 # ============================================================
-# Runner
+# Runner helpers
 # ============================================================
 
 def now_ts() -> int:
@@ -441,17 +447,25 @@ def heartbeat(last_hb: int) -> int:
         return last_hb
     t = now_ts()
     if (t - last_hb) >= HEARTBEAT_SEC:
-        print(f"[{datetime.now(timezone.utc).isoformat()}] heartbeat OK (TOP_N={TOP_N}, TF={TF_ENTRY}/{HTF})")
+        print(f"[{datetime.now(timezone.utc).isoformat()}] heartbeat OK (TOP_N={TOP_N}, TF={TF_ENTRY}/{HTF}, interval={INTERVAL_SEC}s)")
         return t
     return last_hb
 
+
+# ============================================================
+# Main
+# ============================================================
+
 def main():
     print("✅ futures-scanner started")
-    print(f"TF_ENTRY={TF_ENTRY} HTF={HTF} EMA={EMA_FAST}/{EMA_SLOW} TOP_N={TOP_N} MIN_QV={MIN_QUOTE_VOLUME}")
-    print(f"Filters: BTC={USE_BTC_FILTER} HTF={int(os.getenv('USE_HTF_FILTER','1'))} VOL={USE_VOL_FILTER} RSI={USE_RSI_FILTER} MACD0={USE_MACD_NEAR0} MFI={USE_MFI_FILTER}")
-    print(f"Debug: DEBUG={DEBUG} DEBUG_REJECTS={DEBUG_REJECTS}")
+    print(f"BOOT | BINANCE_FAPI={BINANCE_FAPI}")
+    print(f"BOOT | TF_ENTRY={TF_ENTRY} HTF={HTF} EMA={EMA_FAST}/{EMA_SLOW} TOP_N={TOP_N} MIN_QV={MIN_QUOTE_VOLUME}")
+    print(f"BOOT | Filters: BTC={USE_BTC_FILTER} HTF={int(os.getenv('USE_HTF_FILTER','1'))} VOL={USE_VOL_FILTER} RSI={USE_RSI_FILTER} MACD0={USE_MACD_NEAR0} MFI={USE_MFI_FILTER}")
+    print(f"BOOT | Debug: DEBUG={DEBUG} DEBUG_REJECTS={DEBUG_REJECTS} DRY_RUN={DRY_RUN} TEST_ONCE={TEST_ONCE} DEBUG_EVERY_N={DEBUG_EVERY_N}")
+    print(f"BOOT | Storage: USE_STORAGE={USE_STORAGE} PATH={STORAGE_PATH} COOLDOWN_SEC={COOLDOWN_SEC}")
 
     last_hb = now_ts()
+
     while True:
         try:
             last_hb = heartbeat(last_hb)
@@ -460,12 +474,22 @@ def main():
             if DEBUG:
                 print(f"Scanning {len(symbols)} symbols...")
 
+            scanned = 0
+            hits = 0
+
             for sym in symbols:
+                scanned += 1
+
+                if DEBUG and DEBUG_EVERY_N > 0 and (scanned % DEBUG_EVERY_N == 0):
+                    print(f"PROGRESS | scanned={scanned}/{len(symbols)} hits={hits}")
+
                 try:
                     res = entry_cross(sym)
                     if not res:
                         continue
+
                     direction, price, mfi_value = res
+                    hits += 1
 
                     if not can_send(sym, direction):
                         if DEBUG and DEBUG_REJECTS:
@@ -473,19 +497,29 @@ def main():
                         continue
 
                     msg = build_message(sym, direction, price, mfi_value=mfi_value)
-                    send_telegram(msg)
-                    mark_sent(sym, direction)
 
-                    if DEBUG:
-                        print("SENT:", sym, direction, "price", price, "mfi", mfi_value)
+                    if DRY_RUN:
+                        print("DRY_RUN WOULD_SEND:", sym, direction, "price", price, "mfi", mfi_value)
+                    else:
+                        send_telegram(msg)
+                        mark_sent(sym, direction)
+                        if DEBUG:
+                            print("SENT:", sym, direction, "price", price, "mfi", mfi_value)
 
                 except Exception as e:
                     if DEBUG:
                         print("Symbol error:", sym, e)
                     continue
 
+            if DEBUG:
+                print(f"SCAN_DONE | scanned={scanned} hits={hits}")
+
         except Exception as e:
             print("Loop error:", e)
+
+        if TEST_ONCE:
+            print("TEST_ONCE=1 -> exiting after one scan cycle.")
+            return
 
         time.sleep(INTERVAL_SEC)
 
