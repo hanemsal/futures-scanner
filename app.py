@@ -10,18 +10,16 @@ from notify import send_telegram
 from storage import Storage
 
 # ============================================================
-# Futures Scanner (EMA cross + filters) + MFI filter (NEW)
-# - TF_ENTRY: entry timeframe (default 5m)
-# - TF_TREND / HTF: higher timeframe confirmation (default 1h)
+# Futures Scanner (EMA cross + filters) + MFI filter + REJECT DEBUG
 # ============================================================
 
 BINANCE_FAPI = os.getenv("BINANCE_FAPI", "https://fapi.binance.com").rstrip("/")
 
 # --- Timeframes / polling
-TF_ENTRY = os.getenv("TF_ENTRY", os.getenv("TF", "5m"))   # entry tf
-TF_TREND = os.getenv("TF_TREND", os.getenv("HTF", "1h"))  # trend/confirm tf
-HTF = os.getenv("HTF", TF_TREND)                          # keep backward compatibility
-INTERVAL_SEC = int(os.getenv("INTERVAL_SEC", "180"))      # loop interval
+TF_ENTRY = os.getenv("TF_ENTRY", os.getenv("TF", "5m"))
+TF_TREND = os.getenv("TF_TREND", os.getenv("HTF", "1h"))
+HTF = os.getenv("HTF", TF_TREND)
+INTERVAL_SEC = int(os.getenv("INTERVAL_SEC", "180"))
 KLINE_LIMIT = int(os.getenv("KLINE_LIMIT", "260"))
 
 # --- Universe / liquidity
@@ -43,14 +41,14 @@ USE_VOL_FILTER = int(os.getenv("USE_VOL_FILTER", "1"))
 VOL_LEN = int(os.getenv("VOL_LEN", "20"))
 VOL_MULT = float(os.getenv("VOL_MULT", "1.1"))
 
-# --- MACD near-zero filter (optional)  (kept for your ENV; enable/disable here)
+# --- MACD near-zero filter (optional)
 USE_MACD_NEAR0 = int(os.getenv("USE_MACD_NEAR0", "1"))
 MACD_FAST = int(os.getenv("MACD_FAST", "12"))
 MACD_SLOW = int(os.getenv("MACD_SLOW", "26"))
 MACD_SIGNAL = int(os.getenv("MACD_SIGNAL", "9"))
 MACD_NEAR0_PCT = float(os.getenv("MACD_NEAR0_PCT", "0.15"))  # histogram near 0 as % of price
 
-# --- RSI filter (optional) (kept for your ENV)
+# --- RSI filter (optional)
 USE_RSI_FILTER = int(os.getenv("USE_RSI_FILTER", "1"))
 RSI_LEN = int(os.getenv("RSI_LEN", "123"))
 RSI_EMA_LEN = int(os.getenv("RSI_EMA_LEN", "47"))
@@ -59,7 +57,6 @@ RSI_MIN = float(os.getenv("RSI_MIN", "50"))
 # --- MFI filter (NEW)
 USE_MFI_FILTER = int(os.getenv("USE_MFI_FILTER", "1"))
 MFI_LEN = int(os.getenv("MFI_LEN", "14"))
-# Default: LONG: 50..80, SHORT: 20..50
 MFI_LONG_MIN = float(os.getenv("MFI_LONG_MIN", "50"))
 MFI_LONG_MAX = float(os.getenv("MFI_LONG_MAX", "80"))
 MFI_SHORT_MIN = float(os.getenv("MFI_SHORT_MIN", "20"))
@@ -74,19 +71,20 @@ TP_R2 = float(os.getenv("TP_R2", "2"))
 TP_R3 = float(os.getenv("TP_R3", "3"))
 
 # --- Cooldown / state
-COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "21600"))  # 6h default
+COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "21600"))
 USE_STORAGE = int(os.getenv("USE_STORAGE", "1"))
 STORAGE_PATH = os.getenv("STORAGE_PATH", "/var/data/futures_state.json")
 
-# --- Misc
+# --- Debug
 DEBUG = int(os.getenv("DEBUG", "1"))
+DEBUG_REJECTS = int(os.getenv("DEBUG_REJECTS", "1"))  # NEW: 1=print reject reasons
 HEARTBEAT_SEC = int(os.getenv("HEARTBEAT_SEC", "900"))
 
 storage = Storage(STORAGE_PATH) if USE_STORAGE else None
 
 
 # ============================================================
-# Helpers: Binance klines / symbols
+# Helpers: Binance
 # ============================================================
 
 def _get(url: str, params: dict, timeout: int = 12):
@@ -95,9 +93,6 @@ def _get(url: str, params: dict, timeout: int = 12):
     return r.json()
 
 def get_symbols_top_by_volume(top_n: int, min_quote_volume: float) -> List[str]:
-    """
-    Returns USDT perpetual symbols sorted by quoteVolume desc.
-    """
     url = f"{BINANCE_FAPI}/fapi/v1/ticker/24hr"
     data = _get(url, params={}, timeout=20)
 
@@ -135,16 +130,12 @@ def ema(series: List[float], length: int) -> List[float]:
     return out
 
 def rsi_wilder(series: List[float], length: int) -> List[float]:
-    """
-    Wilder's RSI.
-    """
     if length <= 0:
         raise ValueError("RSI length must be > 0")
     if len(series) < length + 1:
         return [50.0] * len(series)
 
-    gains = []
-    losses = []
+    gains, losses = [], []
     for i in range(1, len(series)):
         ch = series[i] - series[i-1]
         gains.append(max(ch, 0.0))
@@ -174,13 +165,9 @@ def macd_hist(series: List[float], fast: int, slow: int, signal: int) -> List[fl
     ema_slow = ema(series, slow)
     macd_line = [a - b for a, b in zip(ema_fast, ema_slow)]
     signal_line = ema(macd_line, signal)
-    hist = [m - s for m, s in zip(macd_line, signal_line)]
-    return hist
+    return [m - s for m, s in zip(macd_line, signal_line)]
 
 def mfi(high: List[float], low: List[float], close: List[float], volume: List[float], length: int) -> List[float]:
-    """
-    Money Flow Index (0..100)
-    """
     n = min(len(high), len(low), len(close), len(volume))
     if n == 0:
         return []
@@ -254,26 +241,27 @@ def vol_ok(volume: List[float]) -> bool:
     ma = sum(volume[-VOL_LEN:]) / VOL_LEN
     return v >= ma * VOL_MULT
 
-def rsi_ok(closes: List[float], direction: str) -> bool:
+def rsi_ok(closes: List[float], direction: str) -> Tuple[bool, float, float]:
     if not USE_RSI_FILTER:
-        return True
+        return True, float("nan"), float("nan")
     r = rsi_wilder(closes, RSI_LEN)
     r_last = r[-1]
     r_ema = ema(r, RSI_EMA_LEN)[-1]
     if direction == "LONG":
-        return (r_last >= RSI_MIN) and (r_last >= r_ema)
+        return (r_last >= RSI_MIN) and (r_last >= r_ema), r_last, r_ema
     else:
-        return (r_last <= (100 - RSI_MIN)) and (r_last <= r_ema)
+        return (r_last <= (100 - RSI_MIN)) and (r_last <= r_ema), r_last, r_ema
 
-def macd_ok(closes: List[float]) -> bool:
+def macd_ok(closes: List[float]) -> Tuple[bool, float]:
     if not USE_MACD_NEAR0:
-        return True
+        return True, float("nan")
     hist = macd_hist(closes, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
     h = hist[-1]
     price = closes[-1]
     if price == 0:
-        return True
-    return abs(h) / price <= (MACD_NEAR0_PCT / 100.0)
+        return True, h
+    ok = abs(h) / price <= (MACD_NEAR0_PCT / 100.0)
+    return ok, h
 
 def mfi_ok(high: List[float], low: List[float], close: List[float], vol: List[float], direction: str) -> Tuple[bool, float]:
     if not USE_MFI_FILTER:
@@ -316,7 +304,7 @@ def htf_confirm(symbol: str, direction: str) -> bool:
 # Message building
 # ============================================================
 
-def calc_tp_sl(price: float, direction: str) -> Tuple[float, float, float, float, float]:
+def calc_tp_sl(price: float, direction: str) -> Tuple[float, float, float, float]:
     if direction == "LONG":
         sl = price * (1 - SL_PCT / 100.0)
     else:
@@ -325,10 +313,10 @@ def calc_tp_sl(price: float, direction: str) -> Tuple[float, float, float, float
     tp1 = price * (1 + (TP_R1 / 100.0)) if direction == "LONG" else price * (1 - (TP_R1 / 100.0))
     tp2 = price * (1 + (TP_R2 / 100.0)) if direction == "LONG" else price * (1 - (TP_R2 / 100.0))
     tp3 = price * (1 + (TP_R3 / 100.0)) if direction == "LONG" else price * (1 - (TP_R3 / 100.0))
-    return sl, tp1, tp2, tp3, price
+    return sl, tp1, tp2, tp3
 
 def build_message(symbol: str, direction: str, price: float, mfi_value: float = float("nan")) -> str:
-    sl, tp1, tp2, tp3, _ = calc_tp_sl(price, direction)
+    sl, tp1, tp2, tp3 = calc_tp_sl(price, direction)
     mfi_part = f"\nMFI({MFI_LEN}): {mfi_value:.2f}" if (USE_MFI_FILTER and not math.isnan(mfi_value)) else ""
     return (
         f"🚀 {direction} SIGNAL\n\n"
@@ -340,6 +328,58 @@ def build_message(symbol: str, direction: str, price: float, mfi_value: float = 
         f"SL: {SL_PCT:.2f}%  ({sl:.6g})\n\n"
         f"#scanner"
     )
+
+
+# ============================================================
+# NEW: Debug reject reasons
+# ============================================================
+
+def reject_log(symbol: str, direction: str, reasons: List[str]):
+    if DEBUG and DEBUG_REJECTS and reasons:
+        print(f"REJECT {symbol} {direction}: " + " | ".join(reasons))
+
+def evaluate_filters(symbol: str, direction: str, high: List[float], low: List[float], close: List[float], vol: List[float]) -> Tuple[bool, float]:
+    """
+    Returns (ok, mfi_value). Prints reject reasons when DEBUG_REJECTS=1.
+    """
+    reasons = []
+
+    # HTF
+    if not htf_confirm(symbol, direction):
+        reasons.append("HTF_CONFIRM_FAIL")
+
+    # BTC
+    if direction == "LONG" and USE_BTC_FILTER and not btc_ok():
+        reasons.append("BTC_FILTER_FAIL")
+
+    # VOL
+    if not vol_ok(vol):
+        v = vol[-1] if vol else float("nan")
+        reasons.append(f"VOL_FAIL(v={v:.4g}, mult={VOL_MULT})")
+
+    # RSI
+    ok_rsi, r_last, r_ema = rsi_ok(close, direction)
+    if not ok_rsi:
+        reasons.append(f"RSI_FAIL(r={r_last:.2f}, ema={r_ema:.2f}, min={RSI_MIN})")
+
+    # MACD
+    ok_macd, h = macd_ok(close)
+    if not ok_macd:
+        reasons.append(f"MACD_NEAR0_FAIL(hist={h:.6g}, near0%={MACD_NEAR0_PCT})")
+
+    # MFI
+    ok_mfi, mfi_value = mfi_ok(high, low, close, vol, direction)
+    if not ok_mfi:
+        if direction == "LONG":
+            reasons.append(f"MFI_FAIL(mfi={mfi_value:.2f}, range={MFI_LONG_MIN}-{MFI_LONG_MAX})")
+        else:
+            reasons.append(f"MFI_FAIL(mfi={mfi_value:.2f}, range={MFI_SHORT_MIN}-{MFI_SHORT_MAX})")
+
+    if reasons:
+        reject_log(symbol, direction, reasons)
+        return False, mfi_value
+
+    return True, mfi_value
 
 
 # ============================================================
@@ -356,7 +396,7 @@ def entry_cross(symbol: str) -> Optional[Tuple[str, float, float]]:
     ef = ema(close, EMA_FAST)
     es = ema(close, EMA_SLOW)
 
-    # last completed bar to reduce noise
+    # last completed bar
     a1, b1 = ef[-3], es[-3]
     a2, b2 = ef[-2], es[-2]
 
@@ -368,23 +408,8 @@ def entry_cross(symbol: str) -> Optional[Tuple[str, float, float]]:
     else:
         return None
 
-    if not htf_confirm(symbol, direction):
-        return None
-
-    if direction == "LONG" and USE_BTC_FILTER and not btc_ok():
-        return None
-
-    if not vol_ok(vol):
-        return None
-
-    if not rsi_ok(close, direction):
-        return None
-
-    if not macd_ok(close):
-        return None
-
-    ok_mfi, mfi_value = mfi_ok(high, low, close, vol, direction)
-    if not ok_mfi:
+    ok, mfi_value = evaluate_filters(symbol, direction, high, low, close, vol)
+    if not ok:
         return None
 
     price = close[-1]
@@ -409,8 +434,7 @@ def can_send(symbol: str, direction: str) -> bool:
 
 def mark_sent(symbol: str, direction: str):
     if USE_STORAGE and storage is not None:
-        key = f"{symbol}:{direction}"
-        storage.set(key, now_ts())
+        storage.set(f"{symbol}:{direction}", now_ts())
 
 def heartbeat(last_hb: int) -> int:
     if HEARTBEAT_SEC <= 0:
@@ -425,6 +449,7 @@ def main():
     print("✅ futures-scanner started")
     print(f"TF_ENTRY={TF_ENTRY} HTF={HTF} EMA={EMA_FAST}/{EMA_SLOW} TOP_N={TOP_N} MIN_QV={MIN_QUOTE_VOLUME}")
     print(f"Filters: BTC={USE_BTC_FILTER} HTF={int(os.getenv('USE_HTF_FILTER','1'))} VOL={USE_VOL_FILTER} RSI={USE_RSI_FILTER} MACD0={USE_MACD_NEAR0} MFI={USE_MFI_FILTER}")
+    print(f"Debug: DEBUG={DEBUG} DEBUG_REJECTS={DEBUG_REJECTS}")
 
     last_hb = now_ts()
     while True:
@@ -443,6 +468,8 @@ def main():
                     direction, price, mfi_value = res
 
                     if not can_send(sym, direction):
+                        if DEBUG and DEBUG_REJECTS:
+                            print(f"COOLDOWN {sym} {direction} (skip)")
                         continue
 
                     msg = build_message(sym, direction, price, mfi_value=mfi_value)
@@ -450,7 +477,7 @@ def main():
                     mark_sent(sym, direction)
 
                     if DEBUG:
-                        print("Sent:", sym, direction, "price", price, "mfi", mfi_value)
+                        print("SENT:", sym, direction, "price", price, "mfi", mfi_value)
 
                 except Exception as e:
                     if DEBUG:
