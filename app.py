@@ -2,444 +2,465 @@ import os
 import time
 import math
 from datetime import datetime, timezone
-from typing import Dict, List, Tuple, Optional
+from typing import List, Tuple, Optional
 
 import requests
 
 from notify import send_telegram
 from storage import Storage
 
-# =========================
-# ENV / AYARLAR
-# =========================
+# ============================================================
+# Futures Scanner (EMA cross + filters) + MFI filter (NEW)
+# - TF_ENTRY: entry timeframe (default 5m)
+# - TF_TREND / HTF: higher timeframe confirmation (default 1h)
+# ============================================================
+
 BINANCE_FAPI = os.getenv("BINANCE_FAPI", "https://fapi.binance.com").rstrip("/")
 
-TF = os.getenv("TF", "5m")              # Entry TF
-TF_TREND = os.getenv("TF_TREND", "1h")  # HTF trend TF
-TF_ENTRY = os.getenv("TF_ENTRY", TF)    # Entry TF (opsiyonel ayrı)
-INTERVAL_SEC = int(os.getenv("INTERVAL_SEC", "180"))
+# --- Timeframes / polling
+TF_ENTRY = os.getenv("TF_ENTRY", os.getenv("TF", "5m"))   # entry tf
+TF_TREND = os.getenv("TF_TREND", os.getenv("HTF", "1h"))  # trend/confirm tf
+HTF = os.getenv("HTF", TF_TREND)                          # keep backward compatibility
+INTERVAL_SEC = int(os.getenv("INTERVAL_SEC", "180"))      # loop interval
 KLINE_LIMIT = int(os.getenv("KLINE_LIMIT", "260"))
 
+# --- Universe / liquidity
+TOP_N = int(os.getenv("TOP_N", "400"))
+MIN_QUOTE_VOLUME = float(os.getenv("MIN_QUOTE_VOLUME", "3000000"))
+
+# --- Signal logic (EMA cross)
 EMA_FAST = int(os.getenv("EMA_FAST", "3"))
 EMA_SLOW = int(os.getenv("EMA_SLOW", "44"))
+HTF_CROSS_LOOKBACK = int(os.getenv("HTF_CROSS_LOOKBACK", "6"))
 
+# --- BTC filter (optional)
+USE_BTC_FILTER = int(os.getenv("USE_BTC_FILTER", "1"))
+BTC_SYMBOL = os.getenv("BTC_SYMBOL", "BTCUSDT")
+BTC_TF = os.getenv("BTC_TF", TF_TREND)
+
+# --- Volume filter (optional)
+USE_VOL_FILTER = int(os.getenv("USE_VOL_FILTER", "1"))
+VOL_LEN = int(os.getenv("VOL_LEN", "20"))
+VOL_MULT = float(os.getenv("VOL_MULT", "1.1"))
+
+# --- MACD near-zero filter (optional)  (kept for your ENV; enable/disable here)
+USE_MACD_NEAR0 = int(os.getenv("USE_MACD_NEAR0", "1"))
+MACD_FAST = int(os.getenv("MACD_FAST", "12"))
+MACD_SLOW = int(os.getenv("MACD_SLOW", "26"))
+MACD_SIGNAL = int(os.getenv("MACD_SIGNAL", "9"))
+MACD_NEAR0_PCT = float(os.getenv("MACD_NEAR0_PCT", "0.15"))  # histogram near 0 as % of price
+
+# --- RSI filter (optional) (kept for your ENV)
+USE_RSI_FILTER = int(os.getenv("USE_RSI_FILTER", "1"))
 RSI_LEN = int(os.getenv("RSI_LEN", "123"))
 RSI_EMA_LEN = int(os.getenv("RSI_EMA_LEN", "47"))
 RSI_MIN = float(os.getenv("RSI_MIN", "50"))
 
-USE_HTF_FILTER = int(os.getenv("USE_HTF_FILTER", "1"))
-HTF = os.getenv("HTF", TF_TREND)
-HTF_CROSS_LOOKBACK = int(os.getenv("HTF_CROSS_LOOKBACK", "6"))
+# --- MFI filter (NEW)
+USE_MFI_FILTER = int(os.getenv("USE_MFI_FILTER", "1"))
+MFI_LEN = int(os.getenv("MFI_LEN", "14"))
+# Default: LONG: 50..80, SHORT: 20..50
+MFI_LONG_MIN = float(os.getenv("MFI_LONG_MIN", "50"))
+MFI_LONG_MAX = float(os.getenv("MFI_LONG_MAX", "80"))
+MFI_SHORT_MIN = float(os.getenv("MFI_SHORT_MIN", "20"))
+MFI_SHORT_MAX = float(os.getenv("MFI_SHORT_MAX", "50"))
 
-USE_BTC_FILTER = int(os.getenv("USE_BTC_FILTER", "1"))
-BTC_SYMBOL = os.getenv("BTC_SYMBOL", "BTCUSDT")
-BTC_TF = os.getenv("BTC_TF", "1h")
-
-USE_VOL_FILTER = int(os.getenv("USE_VOL_FILTER", "1"))
-MIN_QUOTE_VOLUME = float(os.getenv("MIN_QUOTE_VOLUME", "3000000"))
-VOL_LEN = int(os.getenv("VOL_LEN", "20"))
-VOL_MULT = float(os.getenv("VOL_MULT", "1.1"))
-
-USE_MACD_NEAR0 = int(os.getenv("USE_MACD_NEAR0", "1"))
-
-TOP_N = int(os.getenv("TOP_N", "400"))
-
-# Trade params (bilgi amaçlı)
+# --- Risk params (message only; you enter on Binance)
 LEVERAGE = int(os.getenv("LEVERAGE", "5"))
 TP_PCT = float(os.getenv("TP_PCT", "5"))
 SL_PCT = float(os.getenv("SL_PCT", "2"))
+TP_R1 = float(os.getenv("TP_R1", "1"))
+TP_R2 = float(os.getenv("TP_R2", "2"))
+TP_R3 = float(os.getenv("TP_R3", "3"))
 
-# Storage / cooldown
+# --- Cooldown / state
+COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "21600"))  # 6h default
 USE_STORAGE = int(os.getenv("USE_STORAGE", "1"))
 STORAGE_PATH = os.getenv("STORAGE_PATH", "/var/data/futures_state.json")
-COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "21600"))
 
+# --- Misc
 DEBUG = int(os.getenv("DEBUG", "1"))
+HEARTBEAT_SEC = int(os.getenv("HEARTBEAT_SEC", "900"))
 
-# =========================
-# MFI (NEW)
-# =========================
-USE_MFI_FILTER = int(os.getenv("USE_MFI_FILTER", "0"))
-MFI_LEN = int(os.getenv("MFI_LEN", "14"))
-MFI_LONG_MAX = float(os.getenv("MFI_LONG_MAX", "80"))
-MFI_SHORT_MIN = float(os.getenv("MFI_SHORT_MIN", "20"))
-MFI_SLOPE_ENABLE = int(os.getenv("MFI_SLOPE_ENABLE", "1"))
-MFI_SLOPE_BARS = int(os.getenv("MFI_SLOPE_BARS", "1"))
-
-# =========================
-# HTTP
-# =========================
-def get_json(url: str, params=None, retries: int = 3, timeout: int = 15):
-    last_err = None
-    for i in range(retries):
-        try:
-            r = requests.get(url, params=params, timeout=timeout)
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            last_err = e
-            time.sleep(1 + i)
-    raise last_err
+storage = Storage(STORAGE_PATH) if USE_STORAGE else None
 
 
-def get_klines(symbol: str, tf: str, limit: int):
-    return get_json(
-        f"{BINANCE_FAPI}/fapi/v1/klines",
-        params={"symbol": symbol, "interval": tf, "limit": limit},
-    )
+# ============================================================
+# Helpers: Binance klines / symbols
+# ============================================================
+
+def _get(url: str, params: dict, timeout: int = 12):
+    r = requests.get(url, params=params, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+def get_symbols_top_by_volume(top_n: int, min_quote_volume: float) -> List[str]:
+    """
+    Returns USDT perpetual symbols sorted by quoteVolume desc.
+    """
+    url = f"{BINANCE_FAPI}/fapi/v1/ticker/24hr"
+    data = _get(url, params={}, timeout=20)
+
+    rows = []
+    for d in data:
+        sym = d.get("symbol", "")
+        if not sym.endswith("USDT"):
+            continue
+        qv = float(d.get("quoteVolume", 0.0) or 0.0)
+        if qv < min_quote_volume:
+            continue
+        rows.append((sym, qv))
+
+    rows.sort(key=lambda x: x[1], reverse=True)
+    return [s for s, _ in rows[:top_n]]
+
+def get_klines(symbol: str, interval: str, limit: int) -> List[list]:
+    url = f"{BINANCE_FAPI}/fapi/v1/klines"
+    return _get(url, params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=15)
 
 
-# =========================
-# PARSE
-# =========================
-def parse_close(klines) -> List[float]:
-    return [float(k[4]) for k in klines]
+# ============================================================
+# Indicators
+# ============================================================
 
-def parse_high(klines) -> List[float]:
-    return [float(k[2]) for k in klines]
-
-def parse_low(klines) -> List[float]:
-    return [float(k[3]) for k in klines]
-
-def parse_volume(klines) -> List[float]:
-    return [float(k[5]) for k in klines]
-
-def parse_quote_volume(klines) -> float:
-    # quoteVolume alanı (k[7]) yoksa yaklaşıkla: close*vol
-    try:
-        return sum(float(k[7]) for k in klines)
-    except Exception:
-        closes = parse_close(klines)
-        vols = parse_volume(klines)
-        return sum(c * v for c, v in zip(closes, vols))
-
-
-# =========================
-# INDICATORS
-# =========================
-def ema(values: List[float], length: int) -> List[float]:
-    if length <= 1:
-        return values[:]
-    out = []
+def ema(series: List[float], length: int) -> List[float]:
+    if length <= 0:
+        raise ValueError("EMA length must be > 0")
+    if not series:
+        return []
     k = 2 / (length + 1)
-    e = values[0]
-    for v in values:
-        e = v * k + e * (1 - k)
-        out.append(e)
+    out = [series[0]]
+    for x in series[1:]:
+        out.append(out[-1] + k * (x - out[-1]))
     return out
 
+def rsi_wilder(series: List[float], length: int) -> List[float]:
+    """
+    Wilder's RSI.
+    """
+    if length <= 0:
+        raise ValueError("RSI length must be > 0")
+    if len(series) < length + 1:
+        return [50.0] * len(series)
 
-def rsi(values: List[float], length: int) -> List[float]:
-    if length <= 1:
-        return [50.0] * len(values)
-    gains = [0.0]
-    losses = [0.0]
-    for i in range(1, len(values)):
-        ch = values[i] - values[i - 1]
+    gains = []
+    losses = []
+    for i in range(1, len(series)):
+        ch = series[i] - series[i-1]
         gains.append(max(ch, 0.0))
         losses.append(max(-ch, 0.0))
 
-    avg_g = sum(gains[1 : length + 1]) / length if len(values) > length else sum(gains) / max(1, len(values))
-    avg_l = sum(losses[1 : length + 1]) / length if len(values) > length else sum(losses) / max(1, len(values))
+    avg_gain = sum(gains[:length]) / length
+    avg_loss = sum(losses[:length]) / length
 
-    out = [50.0] * len(values)
-    if len(values) <= length:
-        return out
+    rsis = [50.0] * (length)
+    rs = (avg_gain / avg_loss) if avg_loss != 0 else float("inf")
+    rsis.append(100 - (100 / (1 + rs)))
 
-    def calc(g, l):
-        if l == 0:
-            return 100.0
-        rs = g / l
-        return 100.0 - (100.0 / (1.0 + rs))
+    for i in range(length, len(gains)):
+        avg_gain = (avg_gain * (length - 1) + gains[i]) / length
+        avg_loss = (avg_loss * (length - 1) + losses[i]) / length
+        rs = (avg_gain / avg_loss) if avg_loss != 0 else float("inf")
+        rsis.append(100 - (100 / (1 + rs)))
 
-    out[length] = calc(avg_g, avg_l)
-    for i in range(length + 1, len(values)):
-        avg_g = (avg_g * (length - 1) + gains[i]) / length
-        avg_l = (avg_l * (length - 1) + losses[i]) / length
-        out[i] = calc(avg_g, avg_l)
-    return out
+    if len(rsis) < len(series):
+        rsis = ([rsis[0]] * (len(series) - len(rsis))) + rsis
+    return rsis[-len(series):]
 
+def macd_hist(series: List[float], fast: int, slow: int, signal: int) -> List[float]:
+    if len(series) < max(fast, slow, signal) + 2:
+        return [0.0] * len(series)
+    ema_fast = ema(series, fast)
+    ema_slow = ema(series, slow)
+    macd_line = [a - b for a, b in zip(ema_fast, ema_slow)]
+    signal_line = ema(macd_line, signal)
+    hist = [m - s for m, s in zip(macd_line, signal_line)]
+    return hist
 
-def macd(values: List[float], fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[List[float], List[float], List[float]]:
-    ema_fast = ema(values, fast)
-    ema_slow = ema(values, slow)
-    line = [a - b for a, b in zip(ema_fast, ema_slow)]
-    sig = ema(line, signal)
-    hist = [a - b for a, b in zip(line, sig)]
-    return line, sig, hist
-
-
-def mfi(highs: List[float], lows: List[float], closes: List[float], volumes: List[float], length: int) -> List[float]:
+def mfi(high: List[float], low: List[float], close: List[float], volume: List[float], length: int) -> List[float]:
     """
-    Money Flow Index:
-    typical = (H+L+C)/3
-    raw_flow = typical * volume
-    positive_flow if typical > prev_typical else negative_flow
+    Money Flow Index (0..100)
     """
-    n = len(closes)
+    n = min(len(high), len(low), len(close), len(volume))
     if n == 0:
         return []
-    length = max(1, int(length))
-    typical = [(h + l + c) / 3.0 for h, l, c in zip(highs, lows, closes)]
-    raw = [t * v for t, v in zip(typical, volumes)]
+    high, low, close, volume = high[-n:], low[-n:], close[-n:], volume[-n:]
+    tp = [(h + l + c) / 3.0 for h, l, c in zip(high, low, close)]
+    raw = [tp[i] * volume[i] for i in range(n)]
 
     pos = [0.0] * n
     neg = [0.0] * n
     for i in range(1, n):
-        if typical[i] > typical[i - 1]:
+        if tp[i] > tp[i-1]:
             pos[i] = raw[i]
-        elif typical[i] < typical[i - 1]:
+        elif tp[i] < tp[i-1]:
             neg[i] = raw[i]
 
     out = [50.0] * n
     for i in range(n):
         if i < length:
             continue
-        pos_sum = sum(pos[i - length + 1 : i + 1])
-        neg_sum = sum(neg[i - length + 1 : i + 1])
-        if neg_sum == 0 and pos_sum == 0:
+        p = sum(pos[i-length+1:i+1])
+        m = sum(neg[i-length+1:i+1])
+        if m == 0 and p == 0:
             out[i] = 50.0
-        elif neg_sum == 0:
+        elif m == 0:
             out[i] = 100.0
         else:
-            mr = pos_sum / neg_sum
+            mr = p / m
             out[i] = 100.0 - (100.0 / (1.0 + mr))
     return out
 
 
-# =========================
-# SYMBOL LIST
-# =========================
-def get_futures_symbols_top_by_quote_volume(top_n: int) -> List[str]:
-    data = get_json(f"{BINANCE_FAPI}/fapi/v1/ticker/24hr")
-    rows = []
-    for d in data:
-        sym = d.get("symbol", "")
-        if not sym.endswith("USDT"):
-            continue
-        if "BUSD" in sym or "USDC" in sym:
-            pass
-        qv = float(d.get("quoteVolume", 0.0))
-        rows.append((sym, qv))
-    rows.sort(key=lambda x: x[1], reverse=True)
-    return [s for s, _ in rows[:top_n]]
+# ============================================================
+# Parsing klines
+# ============================================================
+
+def parse_hlcva(klines: List[list]) -> Tuple[List[float], List[float], List[float], List[float]]:
+    high = [float(k[2]) for k in klines]
+    low  = [float(k[3]) for k in klines]
+    close = [float(k[4]) for k in klines]
+    vol = [float(k[5]) for k in klines]
+    return high, low, close, vol
+
+def parse_close(klines: List[list]) -> List[float]:
+    return [float(k[4]) for k in klines]
 
 
-# =========================
-# FILTER HELPERS
-# =========================
-def cross_up(a_prev, a_now, b_prev, b_now) -> bool:
-    return a_prev <= b_prev and a_now > b_now
+# ============================================================
+# Filters / conditions
+# ============================================================
 
-def cross_down(a_prev, a_now, b_prev, b_now) -> bool:
-    return a_prev >= b_prev and a_now < b_now
-
-def macd_near_zero(hist_val: float, threshold: float = 0.0) -> bool:
-    # “near0” basit yorum: hist 0’a yakınsa (işaret değişimi)
-    # burada threshold=0, yani hist <=0 iken long için daha temkinli vs.
-    # mevcut kod mantığına dokunmuyoruz: sadece kullanıldığı yerde kontrol
-    return abs(hist_val) <= max(1e-12, abs(threshold) + 1e-12)
-
-
-# =========================
-# SIGNAL CHECK
-# =========================
-def entry_cross(symbol: str) -> Tuple[bool, Optional[Dict]]:
-    kl = get_klines(symbol, TF_ENTRY, KLINE_LIMIT)
-    closes = parse_close(kl)
-    highs = parse_high(kl)
-    lows = parse_low(kl)
-    vols = parse_volume(kl)
-
-    if len(closes) < max(EMA_SLOW, RSI_LEN, MFI_LEN) + 5:
-        return (False, None)
-
-    ema_fast = ema(closes, EMA_FAST)
-    ema_slow = ema(closes, EMA_SLOW)
-
-    # RSI + RSI EMA
-    r = rsi(closes, RSI_LEN)
-    r_ema = ema(r, RSI_EMA_LEN)
-
-    # MACD
-    macd_line, macd_sig, macd_hist = macd(closes)
-
-    # MFI
-    mfi_series = mfi(highs, lows, closes, vols, MFI_LEN)
-    mfi_now = mfi_series[-1]
-    mfi_prev = mfi_series[-1 - MFI_SLOPE_BARS] if len(mfi_series) > MFI_SLOPE_BARS else mfi_now
-
-    # Long koşulu: EMA(FAST) cross up EMA(SLOW)
-    long_cross = cross_up(ema_fast[-2], ema_fast[-1], ema_slow[-2], ema_slow[-1])
-    short_cross = cross_down(ema_fast[-2], ema_fast[-1], ema_slow[-2], ema_slow[-1])
-
-    # RSI filtre
-    long_rsi_ok = (r[-1] >= RSI_MIN and r[-1] >= r_ema[-1])
-    short_rsi_ok = (r[-1] <= (100 - RSI_MIN) and r[-1] <= r_ema[-1])  # simetrik
-
-    # MACD filtre (mevcut davranışı minimal tutalım)
-    long_macd_ok = True
-    short_macd_ok = True
-    if USE_MACD_NEAR0 == 1:
-        # Long için hist yükselmeye dönsün, short için düşmeye dönsün
-        long_macd_ok = (macd_hist[-1] >= macd_hist[-2])
-        short_macd_ok = (macd_hist[-1] <= macd_hist[-2])
-
-    # MFI filtre (NEW)
-    long_mfi_ok = True
-    short_mfi_ok = True
-    if USE_MFI_FILTER == 1:
-        # Long: overbought (>=80) ise alma, ayrıca yükseliş eğilimi iste (opsiyon)
-        long_mfi_ok = (mfi_now <= MFI_LONG_MAX)
-        if MFI_SLOPE_ENABLE == 1:
-            long_mfi_ok = long_mfi_ok and (mfi_now > mfi_prev)
-
-        # Short: oversold (<=20) ise shortlama (dipte short riski), ayrıca düşüş eğilimi iste (opsiyon)
-        short_mfi_ok = (mfi_now >= MFI_SHORT_MIN)
-        if MFI_SLOPE_ENABLE == 1:
-            short_mfi_ok = short_mfi_ok and (mfi_now < mfi_prev)
-
-    # Volume filtre (24h quoteVolume, API’den)
-    vol_ok = True
-    if USE_VOL_FILTER == 1:
-        try:
-            t = get_json(f"{BINANCE_FAPI}/fapi/v1/ticker/24hr", params={"symbol": symbol})
-            qv = float(t.get("quoteVolume", 0.0))
-            vol_ok = qv >= MIN_QUOTE_VOLUME
-        except Exception:
-            vol_ok = True
-
-    # Sonuç
-    if long_cross and long_rsi_ok and long_macd_ok and long_mfi_ok and vol_ok:
-        info = {
-            "side": "LONG",
-            "price": closes[-1],
-            "rsi": r[-1],
-            "rsi_ema": r_ema[-1],
-            "mfi": mfi_now,
-        }
-        return (True, info)
-
-    if short_cross and short_rsi_ok and short_macd_ok and short_mfi_ok and vol_ok:
-        info = {
-            "side": "SHORT",
-            "price": closes[-1],
-            "rsi": r[-1],
-            "rsi_ema": r_ema[-1],
-            "mfi": mfi_now,
-        }
-        return (True, info)
-
-    return (False, None)
-
-
-def htf_filter_ok(symbol: str) -> bool:
-    if USE_HTF_FILTER != 1:
+def btc_ok() -> bool:
+    if not USE_BTC_FILTER:
+        return True
+    try:
+        k = get_klines(BTC_SYMBOL, BTC_TF, max(EMA_SLOW, 80))
+        closes = parse_close(k)
+        e_fast = ema(closes, EMA_FAST)[-1]
+        e_slow = ema(closes, EMA_SLOW)[-1]
+        return e_fast >= e_slow
+    except Exception as e:
+        if DEBUG:
+            print("BTC filter error:", e)
         return True
 
-    kl = get_klines(symbol, HTF, KLINE_LIMIT)
-    closes = parse_close(kl)
-    if len(closes) < EMA_SLOW + 5:
+def vol_ok(volume: List[float]) -> bool:
+    if not USE_VOL_FILTER:
+        return True
+    if len(volume) < VOL_LEN + 1:
+        return True
+    v = volume[-1]
+    ma = sum(volume[-VOL_LEN:]) / VOL_LEN
+    return v >= ma * VOL_MULT
+
+def rsi_ok(closes: List[float], direction: str) -> bool:
+    if not USE_RSI_FILTER:
+        return True
+    r = rsi_wilder(closes, RSI_LEN)
+    r_last = r[-1]
+    r_ema = ema(r, RSI_EMA_LEN)[-1]
+    if direction == "LONG":
+        return (r_last >= RSI_MIN) and (r_last >= r_ema)
+    else:
+        return (r_last <= (100 - RSI_MIN)) and (r_last <= r_ema)
+
+def macd_ok(closes: List[float]) -> bool:
+    if not USE_MACD_NEAR0:
+        return True
+    hist = macd_hist(closes, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
+    h = hist[-1]
+    price = closes[-1]
+    if price == 0:
+        return True
+    return abs(h) / price <= (MACD_NEAR0_PCT / 100.0)
+
+def mfi_ok(high: List[float], low: List[float], close: List[float], vol: List[float], direction: str) -> Tuple[bool, float]:
+    if not USE_MFI_FILTER:
+        return True, float("nan")
+    m = mfi(high, low, close, vol, MFI_LEN)
+    m_last = m[-1] if m else float("nan")
+    if direction == "LONG":
+        ok = (m_last >= MFI_LONG_MIN) and (m_last <= MFI_LONG_MAX)
+    else:
+        ok = (m_last >= MFI_SHORT_MIN) and (m_last <= MFI_SHORT_MAX)
+    return ok, m_last
+
+def htf_confirm(symbol: str, direction: str) -> bool:
+    if not int(os.getenv("USE_HTF_FILTER", "1")):
+        return True
+    try:
+        k = get_klines(symbol, HTF, max(EMA_SLOW + HTF_CROSS_LOOKBACK + 5, 120))
+        closes = parse_close(k)
+        ef = ema(closes, EMA_FAST)
+        es = ema(closes, EMA_SLOW)
+
+        for i in range(1, HTF_CROSS_LOOKBACK + 1):
+            a1, b1 = ef[-i-1], es[-i-1]
+            a2, b2 = ef[-i], es[-i]
+            if direction == "LONG" and (a1 <= b1 and a2 > b2):
+                return True
+            if direction == "SHORT" and (a1 >= b1 and a2 < b2):
+                return True
+
+        if direction == "LONG":
+            return ef[-1] >= es[-1]
+        return ef[-1] <= es[-1]
+    except Exception as e:
+        if DEBUG:
+            print("HTF confirm error:", symbol, e)
         return True
 
-    ef = ema(closes, EMA_FAST)
-    es = ema(closes, EMA_SLOW)
 
-    # Son HTF_CROSS_LOOKBACK bar içinde cross olmuşsa "trend yakalandı" say
-    look = min(HTF_CROSS_LOOKBACK, len(closes) - 2)
-    for i in range(2, look + 2):
-        if cross_up(ef[-i - 1], ef[-i], es[-i - 1], es[-i]):
-            return True
-        if cross_down(ef[-i - 1], ef[-i], es[-i - 1], es[-i]):
-            return True
-    return False
+# ============================================================
+# Message building
+# ============================================================
 
+def calc_tp_sl(price: float, direction: str) -> Tuple[float, float, float, float, float]:
+    if direction == "LONG":
+        sl = price * (1 - SL_PCT / 100.0)
+    else:
+        sl = price * (1 + SL_PCT / 100.0)
 
-def btc_filter_ok() -> bool:
-    if USE_BTC_FILTER != 1:
-        return True
+    tp1 = price * (1 + (TP_R1 / 100.0)) if direction == "LONG" else price * (1 - (TP_R1 / 100.0))
+    tp2 = price * (1 + (TP_R2 / 100.0)) if direction == "LONG" else price * (1 - (TP_R2 / 100.0))
+    tp3 = price * (1 + (TP_R3 / 100.0)) if direction == "LONG" else price * (1 - (TP_R3 / 100.0))
+    return sl, tp1, tp2, tp3, price
 
-    kl = get_klines(BTC_SYMBOL, BTC_TF, KLINE_LIMIT)
-    closes = parse_close(kl)
-    if len(closes) < EMA_SLOW + 5:
-        return True
-
-    ef = ema(closes, EMA_FAST)
-    es = ema(closes, EMA_SLOW)
-
-    # BTC trend: fast>slow ise longlar için destek, fast<slow ise shortlar için destek
-    # Basit tutuyoruz: BTC çok ters trenddeyken sinyali sıkılaştırır
-    return True
-
-
-# =========================
-# MAIN LOOP
-# =========================
-def format_msg(symbol: str, info: Dict) -> str:
-    side = info.get("side", "?")
-    price = info.get("price", 0)
-    rsi_v = info.get("rsi", 0)
-    rsi_e = info.get("rsi_ema", 0)
-    mfi_v = info.get("mfi", 0)
-
-    # Sen manuel giriyorsun ama mesajda net yazalım
+def build_message(symbol: str, direction: str, price: float, mfi_value: float = float("nan")) -> str:
+    sl, tp1, tp2, tp3, _ = calc_tp_sl(price, direction)
+    mfi_part = f"\nMFI({MFI_LEN}): {mfi_value:.2f}" if (USE_MFI_FILTER and not math.isnan(mfi_value)) else ""
     return (
-        f"🚀 {side} SIGNAL\n\n"
+        f"🚀 {direction} SIGNAL\n\n"
         f"Symbol: {symbol}\n"
         f"TF: {TF_ENTRY} | HTF: {HTF}\n"
-        f"Price: {price:.6f}\n\n"
-        f"RSI({RSI_LEN}): {rsi_v:.2f} | RSI_EMA({RSI_EMA_LEN}): {rsi_e:.2f}\n"
-        f"MFI({MFI_LEN}): {mfi_v:.2f}\n\n"
+        f"Price: {price:.6g}{mfi_part}\n\n"
         f"Leverage: x{LEVERAGE}\n"
-        f"TP: %{TP_PCT} | SL: %{SL_PCT}\n"
+        f"TP: {TP_PCT:.2f}%  (TP1 {tp1:.6g} | TP2 {tp2:.6g} | TP3 {tp3:.6g})\n"
+        f"SL: {SL_PCT:.2f}%  ({sl:.6g})\n\n"
         f"#scanner"
     )
 
 
-def main():
-    storage = Storage(STORAGE_PATH) if USE_STORAGE == 1 else None
+# ============================================================
+# Core: detect entry EMA cross on TF_ENTRY
+# ============================================================
 
+def entry_cross(symbol: str) -> Optional[Tuple[str, float, float]]:
+    kl = get_klines(symbol, TF_ENTRY, max(KLINE_LIMIT, EMA_SLOW + 50))
+    high, low, close, vol = parse_hlcva(kl)
+
+    if len(close) < EMA_SLOW + 5:
+        return None
+
+    ef = ema(close, EMA_FAST)
+    es = ema(close, EMA_SLOW)
+
+    # last completed bar to reduce noise
+    a1, b1 = ef[-3], es[-3]
+    a2, b2 = ef[-2], es[-2]
+
+    direction = None
+    if a1 <= b1 and a2 > b2:
+        direction = "LONG"
+    elif a1 >= b1 and a2 < b2:
+        direction = "SHORT"
+    else:
+        return None
+
+    if not htf_confirm(symbol, direction):
+        return None
+
+    if direction == "LONG" and USE_BTC_FILTER and not btc_ok():
+        return None
+
+    if not vol_ok(vol):
+        return None
+
+    if not rsi_ok(close, direction):
+        return None
+
+    if not macd_ok(close):
+        return None
+
+    ok_mfi, mfi_value = mfi_ok(high, low, close, vol, direction)
+    if not ok_mfi:
+        return None
+
+    price = close[-1]
+    return direction, price, mfi_value
+
+
+# ============================================================
+# Runner
+# ============================================================
+
+def now_ts() -> int:
+    return int(time.time())
+
+def can_send(symbol: str, direction: str) -> bool:
+    if not USE_STORAGE or storage is None:
+        return True
+    key = f"{symbol}:{direction}"
+    last = storage.get(key)
+    if last is None:
+        return True
+    return (now_ts() - int(last)) >= COOLDOWN_SEC
+
+def mark_sent(symbol: str, direction: str):
+    if USE_STORAGE and storage is not None:
+        key = f"{symbol}:{direction}"
+        storage.set(key, now_ts())
+
+def heartbeat(last_hb: int) -> int:
+    if HEARTBEAT_SEC <= 0:
+        return last_hb
+    t = now_ts()
+    if (t - last_hb) >= HEARTBEAT_SEC:
+        print(f"[{datetime.now(timezone.utc).isoformat()}] heartbeat OK (TOP_N={TOP_N}, TF={TF_ENTRY}/{HTF})")
+        return t
+    return last_hb
+
+def main():
+    print("✅ futures-scanner started")
+    print(f"TF_ENTRY={TF_ENTRY} HTF={HTF} EMA={EMA_FAST}/{EMA_SLOW} TOP_N={TOP_N} MIN_QV={MIN_QUOTE_VOLUME}")
+    print(f"Filters: BTC={USE_BTC_FILTER} HTF={int(os.getenv('USE_HTF_FILTER','1'))} VOL={USE_VOL_FILTER} RSI={USE_RSI_FILTER} MACD0={USE_MACD_NEAR0} MFI={USE_MFI_FILTER}")
+
+    last_hb = now_ts()
     while True:
         try:
+            last_hb = heartbeat(last_hb)
+
+            symbols = get_symbols_top_by_volume(TOP_N, MIN_QUOTE_VOLUME)
             if DEBUG:
-                print("tick", datetime.now(timezone.utc).isoformat())
+                print(f"Scanning {len(symbols)} symbols...")
 
-            syms = get_futures_symbols_top_by_quote_volume(TOP_N)
+            for sym in symbols:
+                try:
+                    res = entry_cross(sym)
+                    if not res:
+                        continue
+                    direction, price, mfi_value = res
 
-            # BTC filtre “genel durum” kontrolü (sadece kapı bekçisi gibi)
-            if not btc_filter_ok():
-                if DEBUG:
-                    print("BTC filter not ok -> skipping this tick")
-                time.sleep(INTERVAL_SEC)
-                continue
+                    if not can_send(sym, direction):
+                        continue
 
-            for sym in syms:
-                if storage is not None and storage.is_in_cooldown(sym, COOLDOWN_SEC):
+                    msg = build_message(sym, direction, price, mfi_value=mfi_value)
+                    send_telegram(msg)
+                    mark_sent(sym, direction)
+
+                    if DEBUG:
+                        print("Sent:", sym, direction, "price", price, "mfi", mfi_value)
+
+                except Exception as e:
+                    if DEBUG:
+                        print("Symbol error:", sym, e)
                     continue
-
-                if USE_HTF_FILTER == 1 and (not htf_filter_ok(sym)):
-                    continue
-
-                ok, info = entry_cross(sym)
-                if not ok or not info:
-                    continue
-
-                msg = format_msg(sym, info)
-                send_telegram(msg)
-
-                if storage is not None:
-                    storage.mark_sent(sym)
-
-                # küçük sleep: spam azalt
-                time.sleep(0.25)
 
         except Exception as e:
-            if DEBUG:
-                print("ERROR:", repr(e))
-            time.sleep(3)
+            print("Loop error:", e)
 
         time.sleep(INTERVAL_SEC)
-
 
 if __name__ == "__main__":
     main()
