@@ -319,15 +319,22 @@ def btc_ok(reject: Dict[str, int]) -> bool:
 
 def entry_signal(symbol: str) -> Tuple[Optional[dict], Dict[str, int]]:
     reject = {
-        "NO_DATA": 0,
-        "NO_CROSS": 0,
-        "RSI_LOW": 0,
-        "MFI_OUT": 0,
-        "VOL_LOW": 0,
-        "HTF_FAIL": 0,
-        "BTC_FAIL": 0,
-        "SHORT_DISABLED": 0,
-    }
+    "NO_DATA": 0,
+    "NO_CROSS": 0,
+    "RSI_LOW": 0,
+    "MFI_OUT": 0,
+    "VOL_LOW": 0,
+    "HTF_FAIL": 0,
+    "BTC_FAIL": 0,
+    "SHORT_DISABLED": 0,
+
+    # missing keys fix
+    "BTC_TREND_DOWN": 0,
+    "BTC_NO_DATA": 0,
+    "HTF_NO_DATA": 0,
+    "HTF_NO_CROSS": 0,
+    "HTF_TREND_DOWN": 0,
+}
 
     data = load_ohlcv(symbol, TF_ENTRY, KLINE_LIMIT)
     if not data:
