@@ -1,44 +1,42 @@
 import json
 import os
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict
+
 
 class Storage:
+    """
+    Simple JSON state storage to avoid spamming same symbol.
+    Stores last_sent_ts per symbol.
+    """
+
     def __init__(self, path: str):
         self.path = path
-        self._cache: Dict[str, Any] = {}
-        self._loaded = False
+        self.state: Dict[str, Any] = {"last_sent": {}}
+        self._load()
 
-    def _ensure_loaded(self) -> None:
-        if self._loaded:
-            return
-        self._loaded = True
+    def _load(self) -> None:
         try:
             if os.path.exists(self.path):
                 with open(self.path, "r", encoding="utf-8") as f:
-                    self._cache = json.load(f) or {}
-            else:
-                self._cache = {}
+                    self.state = json.load(f)
+            if "last_sent" not in self.state:
+                self.state["last_sent"] = {}
         except Exception:
-            # dosya bozuksa sıfırdan başla
-            self._cache = {}
+            # If corrupted, reset safely
+            self.state = {"last_sent": {}}
 
-    def get(self, key: str) -> Optional[Any]:
-        self._ensure_loaded()
-        return self._cache.get(key)
-
-    def set(self, key: str, value: Any) -> None:
-        self._ensure_loaded()
-        self._cache[key] = value
-        self._persist()
-
-    def _persist(self) -> None:
-        # klasör yoksa oluştur
-        d = os.path.dirname(self.path)
-        if d and not os.path.exists(d):
-            os.makedirs(d, exist_ok=True)
-
+    def _save(self) -> None:
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
         tmp = self.path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(self._cache, f, ensure_ascii=False, indent=2)
+            json.dump(self.state, f, ensure_ascii=False)
         os.replace(tmp, self.path)
+
+    def is_cooldown(self, symbol: str, cooldown_sec: int) -> bool:
+        last = float(self.state.get("last_sent", {}).get(symbol, 0))
+        return (time.time() - last) < cooldown_sec
+
+    def mark_sent(self, symbol: str) -> None:
+        self.state["last_sent"][symbol] = time.time()
+        self._save()
