@@ -1,37 +1,53 @@
 import json
 import os
 import time
-from typing import Dict
+from typing import Any, Dict
 
 class Storage:
-    def __init__(self, path: str):
+    def __init__(self, path: str, enabled: bool = True):
         self.path = path
-        self.state: Dict[str, float] = {}
-        self._load()
+        self.enabled = enabled
+        self._data: Dict[str, Any] = {}
+        self._loaded = False
 
-    def _load(self) -> None:
+        # ensure dir exists
+        if self.enabled:
+            d = os.path.dirname(self.path)
+            if d and not os.path.exists(d):
+                os.makedirs(d, exist_ok=True)
+
+    def _load(self):
+        if not self.enabled or self._loaded:
+            return
+        self._loaded = True
         try:
             if os.path.exists(self.path):
                 with open(self.path, "r", encoding="utf-8") as f:
-                    self.state = json.load(f)
+                    self._data = json.load(f) or {}
             else:
-                self.state = {}
+                self._data = {}
         except Exception:
-            self.state = {}
+            self._data = {}
 
-    def _save(self) -> None:
-        os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        tmp = self.path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(self.state, f)
-        os.replace(tmp, self.path)
+    def _save(self):
+        if not self.enabled:
+            return
+        try:
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._data, f, ensure_ascii=False)
+            os.replace(tmp, self.path)
+        except Exception:
+            pass
 
-    def mark_sent(self, symbol: str) -> None:
-        self.state[symbol] = time.time()
+    def get_int(self, key: str, default: int = 0) -> int:
+        self._load()
+        try:
+            return int(self._data.get(key, default))
+        except Exception:
+            return default
+
+    def set_int(self, key: str, value: int):
+        self._load()
+        self._data[key] = int(value)
         self._save()
-
-    def is_on_cooldown(self, symbol: str, cooldown_sec: int) -> bool:
-        ts = self.state.get(symbol)
-        if not ts:
-            return False
-        return (time.time() - ts) < cooldown_sec
