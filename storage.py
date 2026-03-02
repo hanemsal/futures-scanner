@@ -1,42 +1,44 @@
 import json
 import os
 import time
-from typing import Any, Dict
-
+from typing import Any, Dict, Optional
 
 class Storage:
-    """
-    Simple JSON state storage to avoid spamming same symbol.
-    Stores last_sent_ts per symbol.
-    """
-
     def __init__(self, path: str):
         self.path = path
-        self.state: Dict[str, Any] = {"last_sent": {}}
-        self._load()
+        self._ensure_dir()
 
-    def _load(self) -> None:
+    def _ensure_dir(self) -> None:
+        d = os.path.dirname(self.path)
+        if d and not os.path.exists(d):
+            os.makedirs(d, exist_ok=True)
+
+    def _read(self) -> Dict[str, Any]:
         try:
-            if os.path.exists(self.path):
-                with open(self.path, "r", encoding="utf-8") as f:
-                    self.state = json.load(f)
-            if "last_sent" not in self.state:
-                self.state["last_sent"] = {}
+            if not os.path.exists(self.path):
+                return {}
+            with open(self.path, "r", encoding="utf-8") as f:
+                return json.load(f) or {}
         except Exception:
-            # If corrupted, reset safely
-            self.state = {"last_sent": {}}
+            return {}
 
-    def _save(self) -> None:
-        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+    def _write(self, data: Dict[str, Any]) -> None:
         tmp = self.path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(self.state, f, ensure_ascii=False)
+            json.dump(data, f, ensure_ascii=False, indent=2)
         os.replace(tmp, self.path)
 
-    def is_cooldown(self, symbol: str, cooldown_sec: int) -> bool:
-        last = float(self.state.get("last_sent", {}).get(symbol, 0))
-        return (time.time() - last) < cooldown_sec
+    def get_last_signal_ts(self, symbol: str) -> Optional[int]:
+        data = self._read()
+        v = data.get("last_signal_ts", {}).get(symbol)
+        if isinstance(v, (int, float)):
+            return int(v)
+        return None
 
-    def mark_sent(self, symbol: str) -> None:
-        self.state["last_sent"][symbol] = time.time()
-        self._save()
+    def set_last_signal_ts(self, symbol: str, ts: int) -> None:
+        data = self._read()
+        if "last_signal_ts" not in data or not isinstance(data["last_signal_ts"], dict):
+            data["last_signal_ts"] = {}
+        data["last_signal_ts"][symbol] = int(ts)
+        data["updated_at"] = int(time.time())
+        self._write(data)
