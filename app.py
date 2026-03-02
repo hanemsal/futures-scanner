@@ -23,6 +23,9 @@ HTF = os.getenv("HTF", os.getenv("TF_TREND", "4h"))      # higher tf trend
 INTERVAL_SEC = int(os.getenv("INTERVAL_SEC", "600"))
 KLINE_LIMIT = int(os.getenv("KLINE_LIMIT", "260"))
 
+USE_WT_DIP = int(os.getenv("USE_WT_DIP", "1")) == 1
+USE_WT_CONTINUATION = int(os.getenv("USE_WT_CONTINUATION", "0")) == 1
+
 # Signal logic
 EMA_FAST = int(os.getenv("EMA_FAST", "3"))
 EMA_SLOW = int(os.getenv("EMA_SLOW", "44"))
@@ -383,8 +386,8 @@ def wt_confirm_ok(series: Series, reject: Dict[str, int]) -> bool:
         and (k[-1] > d[-1])
     )
 
-    if dip_reversal or continuation:
-        return True
+    if (USE_WT_DIP and dip_reversal) or (USE_WT_CONTINUATION and continuation):
+    return True
 
     reject["WT_CONFIRM"] = reject.get("WT_CONFIRM", 0) + 1
     return False
