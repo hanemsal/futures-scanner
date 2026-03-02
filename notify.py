@@ -1,13 +1,12 @@
 import os
 import requests
 
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
-TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
+TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
+TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 
 def send_telegram(text: str) -> None:
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        print("[WARN] TG_BOT_TOKEN / TG_CHAT_ID missing. Message:", text, flush=True)
-        return
+        raise RuntimeError("TG_BOT_TOKEN / TG_CHAT_ID missing")
 
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     payload = {
@@ -15,5 +14,5 @@ def send_telegram(text: str) -> None:
         "text": text,
         "disable_web_page_preview": True,
     }
-    r = requests.post(url, json=payload, timeout=20)
+    r = requests.post(url, json=payload, timeout=15)
     r.raise_for_status()
