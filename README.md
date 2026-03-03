@@ -2,40 +2,49 @@
 
 Binance Futures USDT-PERP scanner + Telegram alerts (LONG only).
 
-## Default logic (TradingView-like)
-- TF_ENTRY: 1h
-- Signal when:
-  - EMA(3) crosses ABOVE EMA(44) within LOOKBACK bars (on TF_ENTRY)
-  - RSI(21) >= RSI_MIN
-  - Stoch RSI (K=5, D=5) computed for info / optional gating
-  - WaveTrend (LazyBear-ish) computed
-  - WT Dip mode (optional): oversold dip reversal (WT1 cross up WT2 from OS zone)
+## What it does
+Entry (TF_ENTRY, default 1h):
+- EMA(FAST) crossed above EMA(SLOW) within LOOKBACK bars AND currently EMA_FAST > EMA_SLOW
+- RSI(RSI_LEN) >= RSI_MIN
+- Optional: WaveTrend + StochRSI filters
+- Optional: BTC filter, HTF filter, Volume spike, MFI
+
+Signal types:
+- WT_DIP: WT1 <= WT_OS2 and turning up (dip reversal)
+- WT_CONT: WT1 > 0 and crossed up WT2 under WT_OB2 (trend continuation)
 
 ## Render (Background Worker)
-- Build: `pip install -r requirements.txt`
-- Start: `python app.py`
-- Disk mount path: `/var/data`
-- Recommended: `STORAGE_PATH=/var/data/futures_state.json`
+Build command:
+- pip install -r requirements.txt
 
-## ENV (minimum)
+Start command:
+- python app.py
+
+Disk:
+- Mount: /var/data (recommended)
+- STORAGE_PATH: /var/data/futures_state.json
+
+## Key ENV
+Required:
 - TG_BOT_TOKEN
 - TG_CHAT_ID
+
+Recommended defaults:
 - TF_ENTRY=1h
 - EMA_FAST=3
 - EMA_SLOW=44
+- LOOKBACK=6
 - RSI_LEN=21
 - RSI_MIN=42
-- LOOKBACK=6
 - TOP_N=200
 - MIN_QUOTE_VOLUME=3000000
 - COOLDOWN_SEC=21600
 - USE_STORAGE=1
 - STORAGE_PATH=/var/data/futures_state.json
+
+WT/Stoch:
 - USE_WT=1
-- WT_CH_LEN=9
-- WT_AVG_LEN=12
-- WT_OB1=60 WT_OB2=53 WT_OS1=-60 WT_OS2=-53
-- USE_WT_DIP=1
-- USE_WT_CONTINUATION=0
 - USE_STOCH_RSI=1
-- STOCH_K=5 STOCH_D=5 STOCH_RSI_LEN=14
+- USE_WT_DIP=1
+- USE_WT_CONTINUATION=0 (enable for hybrid)
+- USE_LAST_CANDLE=0 (no repaint)
