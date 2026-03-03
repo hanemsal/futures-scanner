@@ -6,55 +6,59 @@ from typing import Any, Dict, Optional
 
 class Storage:
     """
-    Basit JSON state:
-    {
-      "symbols": {
-        "XRPUSDT": {"entry": 1710000000},
-        "XRPUSDT:exit": {"exit": 1710000500}
-      }
-    }
+    Persistent state for:
+    - cooldown timestamps (per symbol, per signal kind)
+    - open positions (entry sent -> exit watch)
     """
 
     def __init__(self, path: str):
         self.path = path
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        self.state: Dict[str, Any] = {"symbols": {}}
+        self.state: Dict[str, Any] = {
+            "last_sent": {},   # key -> ts
+            "open": {},        # symbol -> {"ts":..., "kind":...}
+        }
         self._load()
 
-    def _load(self):
-        if not os.path.exists(self.path):
-            self._save()
-            return
+    def _load(self) -> None:
         try:
-            with open(self.path, "r", encoding="utf-8") as f:
-                self.state = json.load(f)
-            if "symbols" not in self.state:
-                self.state = {"symbols": {}}
-        except Exception:
-            self.state = {"symbols": {}}
+            if os.path.exists(self.path):
+                with open(self.path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    self.state.update(data)
+        except Exception as e:
+            print(f"[STORAGE] load failed: {e}")
 
-    def _save(self):
-        tmp = self.path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(self.state, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, self.path)
+    def _save(self) -> None:
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.state, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self.path)
+        except Exception as e:
+            print(f"[STORAGE] save failed: {e}")
 
-    def get_last(self, key: str, event: str) -> Optional[int]:
-        sym = self.state.get("symbols", {}).get(key, {})
-        v = sym.get(event)
-        return int(v) if v else None
+    @staticmethod
+    def _now() -> int:
+        return int(time.time())
 
-    def mark_event(self, key: str, event: str):
-        now = int(time.time())
-        if "symbols" not in self.state:
-            self.state["symbols"] = {}
-        if key not in self.state["symbols"]:
-            self.state["symbols"][key] = {}
-        self.state["symbols"][key][event] = now
+    def is_cooldown(self, key: str, cooldown_sec: int) -> bool:
+        last = int(self.state.get("last_sent", {}).get(key, 0) or 0)
+        return (self._now() - last) < cooldown_sec
+
+    def mark_sent(self, key: str) -> None:
+        self.state.setdefault("last_sent", {})[key] = self._now()
         self._save()
 
-    def in_cooldown(self, key: str, cooldown_sec: int) -> bool:
-        last = self.get_last(key, "entry") or self.get_last(key, "exit")
-        if not last:
-            return False
-        return (int(time.time()) - int(last)) < int(cooldown_sec)
+    def set_open(self, symbol: str, kind: str) -> None:
+        self.state.setdefault("open", {})[symbol] = {"ts": self._now(), "kind": kind}
+        self._save()
+
+    def clear_open(self, symbol: str) -> None:
+        if symbol in self.state.get("open", {}):
+            del self.state["open"][symbol]
+            self._save()
+
+    def get_open(self) -> Dict[str, Any]:
+        return dict(self.state.get("open", {}))
