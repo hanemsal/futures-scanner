@@ -1,124 +1,251 @@
+#!/usr/bin/env python3
 import os
+import json
 import time
-import math
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional
 
 import requests
 
-from notify import send_telegram
-from storage import Storage
-
 BINANCE_FAPI = os.getenv("BINANCE_FAPI", "https://fapi.binance.com").rstrip("/")
 
-# ===== Telegram =====
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
-TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
-HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "12"))
-
-# ===== Core =====
-TF_ENTRY = os.getenv("TF_ENTRY", "1h")           # entry timeframe
-KLINE_LIMIT = int(os.getenv("KLINE_LIMIT", "260"))
+# =========================
+# GENERAL
+# =========================
+TF_ENTRY = os.getenv("TF_ENTRY", "1h")          # entry timeframe
+HTF = os.getenv("HTF", "4h")                    # higher timeframe (optional, currently only used in message header)
 INTERVAL_SEC = int(os.getenv("INTERVAL_SEC", "600"))
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "12"))
+KLINE_LIMIT = int(os.getenv("KLINE_LIMIT", "260"))
 TOP_N = int(os.getenv("TOP_N", "200"))
 MIN_QUOTE_VOLUME = float(os.getenv("MIN_QUOTE_VOLUME", "3000000"))
 ONLY_USDT_PERP = int(os.getenv("ONLY_USDT_PERP", "1"))
+LONG_ONLY = int(os.getenv("LONG_ONLY", "1"))
 
-# ===== EMA / RSI =====
+DEBUG = int(os.getenv("DEBUG", "1"))
+DEBUG_REJECTS = int(os.getenv("DEBUG_REJECTS", "0"))
+TEST_ONCE = int(os.getenv("TEST_ONCE", "0"))
+DRY_RUN = int(os.getenv("DRY_RUN", "0"))
+HEARTBEAT_SEC = int(os.getenv("HEARTBEAT_SEC", "900"))
+
+# If 1 -> evaluate signals on the LAST CLOSED candle (safer)
+USE_LAST_CANDLE = int(os.getenv("USE_LAST_CANDLE", "1"))
+
+# =========================
+# TELEGRAM
+# =========================
+TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
+TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
+
+def send_telegram(text: str) -> None:
+    """Minimal telegram sender (no external notify.py dependency)."""
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        if DEBUG:
+            print("[WARN] TG_BOT_TOKEN / TG_CHAT_ID missing; message skipped.")
+        return
+    if DRY_RUN:
+        print("[DRY_RUN] Would send:\n", text)
+        return
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TG_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=HTTP_TIMEOUT)
+        if r.status_code != 200:
+            print("[ERR] Telegram send failed:", r.status_code, r.text[:500])
+    except Exception as e:
+        print("[ERR] Telegram exception:", repr(e))
+
+# =========================
+# STORAGE (cooldown + dedupe)
+# =========================
+STORAGE_PATH = os.getenv("STORAGE_PATH", "/var/data/futures_state.json")
+USE_STORAGE = int(os.getenv("USE_STORAGE", "1"))
+COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "21600"))  # 6 hours default
+
+@dataclass
+class Storage:
+    path: str
+    data: Dict[str, Dict[str, float]] = field(default_factory=dict)
+
+    def load(self) -> None:
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                self.data = json.load(f) or {}
+        except FileNotFoundError:
+            self.data = {}
+        except Exception:
+            self.data = {}
+
+    def save(self) -> None:
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        except Exception:
+            pass
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(self.data, f)
+        except Exception:
+            pass
+
+    def _get(self, sym: str) -> Dict[str, float]:
+        if sym not in self.data or not isinstance(self.data.get(sym), dict):
+            self.data[sym] = {}
+        return self.data[sym]
+
+    def is_cooldown(self, sym: str, key: str, cooldown_sec: int) -> bool:
+        """key: 'entry' or 'close' etc."""
+        now = time.time()
+        d = self._get(sym)
+        last = float(d.get(f"last_{key}_ts", 0.0))
+        return (now - last) < cooldown_sec
+
+    def touch(self, sym: str, key: str) -> None:
+        d = self._get(sym)
+        d[f"last_{key}_ts"] = time.time()
+
+# =========================
+# INDICATORS
+# =========================
+def ema(values: List[float], length: int) -> List[float]:
+    if length <= 1:
+        return values[:]
+    k = 2 / (length + 1)
+    out = []
+    prev = values[0]
+    out.append(prev)
+    for v in values[1:]:
+        prev = v * k + prev * (1 - k)
+        out.append(prev)
+    return out
+
+def rsi(values: List[float], length: int) -> List[float]:
+    if length <= 1 or len(values) < length + 1:
+        return [50.0] * len(values)
+    gains = [0.0]
+    losses = [0.0]
+    for i in range(1, len(values)):
+        ch = values[i] - values[i - 1]
+        gains.append(max(ch, 0.0))
+        losses.append(max(-ch, 0.0))
+    avg_gain = sum(gains[1:length+1]) / length
+    avg_loss = sum(losses[1:length+1]) / length
+    out = [50.0] * (length)  # seed
+    rs = (avg_gain / avg_loss) if avg_loss != 0 else 999999.0
+    out.append(100 - (100 / (1 + rs)))
+    for i in range(length + 1, len(values)):
+        avg_gain = (avg_gain * (length - 1) + gains[i]) / length
+        avg_loss = (avg_loss * (length - 1) + losses[i]) / length
+        rs = (avg_gain / avg_loss) if avg_loss != 0 else 999999.0
+        out.append(100 - (100 / (1 + rs)))
+    if len(out) < len(values):
+        out = out + [out[-1]] * (len(values) - len(out))
+    return out[:len(values)]
+
+def sma(values: List[float], length: int) -> List[float]:
+    if length <= 1:
+        return values[:]
+    out = []
+    s = 0.0
+    for i, v in enumerate(values):
+        s += v
+        if i >= length:
+            s -= values[i - length]
+        if i >= length - 1:
+            out.append(s / length)
+        else:
+            out.append(v)
+    return out
+
+def stoch_rsi(values: List[float], rsi_len: int, stoch_len: int, k: int, d: int) -> Tuple[List[float], List[float]]:
+    r = rsi(values, rsi_len)
+    stoch = []
+    for i in range(len(r)):
+        lo = min(r[max(0, i - stoch_len + 1): i + 1])
+        hi = max(r[max(0, i - stoch_len + 1): i + 1])
+        if hi - lo == 0:
+            stoch.append(50.0)
+        else:
+            stoch.append(100 * (r[i] - lo) / (hi - lo))
+    k_line = sma(stoch, k)
+    d_line = sma(k_line, d)
+    return k_line, d_line
+
+def wavetrend(hlc3: List[float], ch_len: int, avg_len: int) -> Tuple[List[float], List[float]]:
+    esa = ema(hlc3, ch_len)
+    abs_diff = [abs(hlc3[i] - esa[i]) for i in range(len(hlc3))]
+    d = ema(abs_diff, ch_len)
+    ci = []
+    for i in range(len(hlc3)):
+        denom = 0.015 * d[i] if d[i] != 0 else 1e-9
+        ci.append((hlc3[i] - esa[i]) / denom)
+    wt1 = ema(ci, avg_len)
+    wt2 = sma(wt1, 4)
+    return wt1, wt2
+
+def cross_up(a_prev: float, a: float, b_prev: float, b: float) -> bool:
+    return a_prev <= b_prev and a > b
+
+def cross_down(a_prev: float, a: float, b_prev: float, b: float) -> bool:
+    return a_prev >= b_prev and a < b
+
+# =========================
+# STRATEGY PARAMS
+# =========================
 EMA_FAST = int(os.getenv("EMA_FAST", "3"))
 EMA_SLOW = int(os.getenv("EMA_SLOW", "44"))
-LOOKBACK = int(os.getenv("LOOKBACK", "6"))
+EMA_TOL_PCT = float(os.getenv("EMA_TOL_PCT", "0.002"))  # 0.2% tolerance
+
 RSI_LEN = int(os.getenv("RSI_LEN", "21"))
 RSI_MIN = float(os.getenv("RSI_MIN", "42"))
 
-# Eğer 1 yaparsan sadece "son kapanan mum" üstünden sinyal üretir
-# (kapanmamış son mumu yok sayar)
-USE_LAST_CANDLE = int(os.getenv("USE_LAST_CANDLE", "0"))
-
-# ===== Feature toggles =====
-DEBUG = int(os.getenv("DEBUG", "1"))
-DEBUG_REJECTS = int(os.getenv("DEBUG_REJECTS", "0"))
-DRY_RUN = int(os.getenv("DRY_RUN", "0"))
-TEST_ONCE = int(os.getenv("TEST_ONCE", "0"))
-
-USE_STORAGE = int(os.getenv("USE_STORAGE", "1"))
-STORAGE_PATH = os.getenv("STORAGE_PATH", "/var/data/futures_state.json")
-COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "21600"))  # 6 saat
-
-HEARTBEAT_SEC = int(os.getenv("HEARTBEAT_SEC", "900"))
-
-# ===== Optional filters =====
-USE_HTF_FILTER = int(os.getenv("USE_HTF_FILTER", "0"))
-HTF = os.getenv("HTF", "4h")
-EMA_TREND = int(os.getenv("EMA_TREND", "123"))
-
-USE_BTC_FILTER = int(os.getenv("USE_BTC_FILTER", "0"))
-BTC_SYMBOL = os.getenv("BTC_SYMBOL", "BTCUSDT")
-BTC_TF = os.getenv("BTC_TF", "4h")
-
-USE_VOL_FILTER = int(os.getenv("USE_VOL_FILTER", "0"))
-VOL_LEN = int(os.getenv("VOL_LEN", "20"))
-VOL_MULT = float(os.getenv("VOL_MULT", "1.1"))
-VOL_USE_QUOTE = int(os.getenv("VOL_USE_QUOTE", "1"))
-
-USE_MFI_FILTER = int(os.getenv("USE_MFI_FILTER", "0"))
-MFI_LEN = int(os.getenv("MFI_LEN", "14"))
-MFI_LONG_MIN = float(os.getenv("MFI_LONG_MIN", "40"))
-MFI_LONG_MAX = float(os.getenv("MFI_LONG_MAX", "85"))
-MFI_SLOPE_ENABLE = int(os.getenv("MFI_SLOPE_ENABLE", "1"))
-MFI_SLOPE_BARS = int(os.getenv("MFI_SLOPE_BARS", "1"))
-
-# ===== Stoch RSI =====
 USE_STOCH_RSI = int(os.getenv("USE_STOCH_RSI", "1"))
 STOCH_RSI_LEN = int(os.getenv("STOCH_RSI_LEN", "14"))
 STOCH_K = int(os.getenv("STOCH_K", "5"))
 STOCH_D = int(os.getenv("STOCH_D", "5"))
+STOCH_OS = float(os.getenv("STOCH_OS", "20"))
+STOCH_OB = float(os.getenv("STOCH_OB", "80"))
 
-# ===== WaveTrend =====
 USE_WT = int(os.getenv("USE_WT", "1"))
 WT_CH = int(os.getenv("WT_CH", "12"))
 WT_AVG = int(os.getenv("WT_AVG", "12"))
-WT_CH_LEN = int(os.getenv("WT_CH_LEN", "9"))      # EMA for wt1
-WT_AVG_LEN = int(os.getenv("WT_AVG_LEN", "12"))   # SMA for wt2
-
 WT_OS1 = float(os.getenv("WT_OS1", "-60"))
 WT_OS2 = float(os.getenv("WT_OS2", "-53"))
 WT_OB1 = float(os.getenv("WT_OB1", "60"))
 WT_OB2 = float(os.getenv("WT_OB2", "53"))
 
-# Signal modes
-USE_WT_DIP = int(os.getenv("USE_WT_DIP", "1"))               # dip reversal
-USE_WT_CONTINUATION = int(os.getenv("USE_WT_CONTINUATION", "1"))  # continuation
+LOOKBACK = int(os.getenv("LOOKBACK", "6"))
 
-# Close alerts
-USE_CLOSE_ALERT = int(os.getenv("USE_CLOSE_ALERT", "1"))     # exit signal göndermek
+USE_WT_DIP = int(os.getenv("USE_WT_DIP", "1"))
+USE_WT_CONTINUATION = int(os.getenv("USE_WT_CONTINUATION", "1"))
+
+WT_CONT_WT2_MAX = float(os.getenv("WT_CONT_WT2_MAX", "-35"))
+WT_CONT_STOCH_MIN = float(os.getenv("WT_CONT_STOCH_MIN", "60"))
+WT_CONT_RSI_MIN = float(os.getenv("WT_CONT_RSI_MIN", "50"))
+
+ENABLE_CLOSE = int(os.getenv("ENABLE_CLOSE", "1"))
+CLOSE_STRICT_OB1 = int(os.getenv("CLOSE_STRICT_OB1", "0"))
+CLOSE_COOLDOWN_SEC = int(os.getenv("CLOSE_COOLDOWN_SEC", str(COOLDOWN_SEC)))
+
 TP_PCT = float(os.getenv("TP_PCT", "8"))
 SL_PCT = float(os.getenv("SL_PCT", "2"))
 
-LONG_ONLY = int(os.getenv("LONG_ONLY", "1"))  # şimdilik sadece long
-
 # =========================
-# Helpers
+# BINANCE API
 # =========================
-def log(msg: str) -> None:
-    if DEBUG:
-        print(msg, flush=True)
-
-def reject(rejects: Dict[str, int], reason: str) -> None:
-    rejects[reason] = rejects.get(reason, 0) + 1
-
-def ts_now() -> str:
-    return datetime.now(timezone.utc).astimezone().strftime("%H:%M:%S")
-
-def http_get(path: str, params: dict) -> dict:
+def http_get(path: str, params: Optional[Dict] = None):
     url = f"{BINANCE_FAPI}{path}"
-    r = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
+    r = requests.get(url, params=params or {}, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
     return r.json()
 
-def get_futures_symbols() -> List[str]:
-    info = http_get("/fapi/v1/exchangeInfo", {})
-    symbols = []
+def get_usdt_perp_symbols() -> List[str]:
+    info = http_get("/fapi/v1/exchangeInfo")
+    out = []
     for s in info.get("symbols", []):
         if s.get("status") != "TRADING":
             continue
@@ -127,431 +254,227 @@ def get_futures_symbols() -> List[str]:
                 continue
             if s.get("contractType") != "PERPETUAL":
                 continue
-        symbols.append(s["symbol"])
-    return symbols
+        out.append(s.get("symbol"))
+    return out
 
-def get_24h_tickers() -> List[dict]:
-    return http_get("/fapi/v1/ticker/24hr", {})
-
-def top_by_quote_volume(symbols: List[str], top_n: int) -> List[Tuple[str, float]]:
-    tickers = get_24h_tickers()
-    m = {t["symbol"]: float(t.get("quoteVolume", 0) or 0) for t in tickers if "symbol" in t}
-    items = [(sym, m.get(sym, 0.0)) for sym in symbols]
-    items.sort(key=lambda x: x[1], reverse=True)
-    return items[:top_n]
+def get_top_symbols_by_quote_volume(symbols: List[str], top_n: int) -> List[str]:
+    tickers = http_get("/fapi/v1/ticker/24hr")
+    vol_map = {}
+    for t in tickers:
+        sym = t.get("symbol")
+        if sym not in symbols:
+            continue
+        try:
+            qv = float(t.get("quoteVolume", 0.0))
+        except Exception:
+            qv = 0.0
+        vol_map[sym] = qv
+    filt = [(s, vol_map.get(s, 0.0)) for s in symbols if vol_map.get(s, 0.0) >= MIN_QUOTE_VOLUME]
+    filt.sort(key=lambda x: x[1], reverse=True)
+    return [s for s, _ in filt[:top_n]]
 
 def get_klines(symbol: str, interval: str, limit: int) -> List[List]:
-    return http_get("/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit})
+    return http_get("/fapi/v1/klines", params={"symbol": symbol, "interval": interval, "limit": limit})
 
-def closes_from_klines(kl: List[List]) -> Tuple[List[float], List[float], List[float]]:
-    # returns close, high, low
-    close = [float(x[4]) for x in kl]
-    high = [float(x[2]) for x in kl]
-    low = [float(x[3]) for x in kl]
-    return close, high, low
+def klines_to_ohlc(kl: List[List]) -> Tuple[List[float], List[float], List[float], List[float], List[float]]:
+    o, h, l, c, v = [], [], [], [], []
+    for k in kl:
+        o.append(float(k[1])); h.append(float(k[2])); l.append(float(k[3])); c.append(float(k[4])); v.append(float(k[5]))
+    return o, h, l, c, v
 
-def volumes_from_klines(kl: List[List]) -> List[float]:
-    return [float(x[5]) for x in kl]
+# =========================
+# SIGNAL LOGIC
+# =========================
+def ema_ok(ema_fast_val: float, ema_slow_val: float) -> bool:
+    return ema_fast_val >= ema_slow_val * (1 - EMA_TOL_PCT)
 
-def ema(series: List[float], length: int) -> List[float]:
-    if length <= 1:
-        return series[:]
-    k = 2 / (length + 1)
-    out = []
-    e = series[0]
-    for v in series:
-        e = v * k + e * (1 - k)
-        out.append(e)
-    return out
-
-def sma(series: List[float], length: int) -> List[float]:
-    out = []
-    s = 0.0
-    for i, v in enumerate(series):
-        s += v
-        if i >= length:
-            s -= series[i - length]
-        if i + 1 < length:
-            out.append(float("nan"))
-        else:
-            out.append(s / length)
-    return out
-
-def rsi(series: List[float], length: int) -> List[float]:
-    if length <= 1:
-        return [50.0] * len(series)
-    gains = [0.0]
-    losses = [0.0]
-    for i in range(1, len(series)):
-        ch = series[i] - series[i - 1]
-        gains.append(max(ch, 0.0))
-        losses.append(max(-ch, 0.0))
-    avg_g = ema(gains, length)
-    avg_l = ema(losses, length)
-    out = []
-    for g, l in zip(avg_g, avg_l):
-        if l == 0:
-            out.append(100.0)
-        else:
-            rs = g / l
-            out.append(100.0 - (100.0 / (1.0 + rs)))
-    return out
-
-def stoch_rsi(rsi_vals: List[float], length: int, k_len: int, d_len: int) -> Tuple[List[float], List[float]]:
-    # Stoch RSI 0-100
-    st = []
-    for i in range(len(rsi_vals)):
-        start = max(0, i - length + 1)
-        window = rsi_vals[start:i + 1]
-        lo = min(window)
-        hi = max(window)
-        if hi - lo == 0:
-            st.append(0.0)
-        else:
-            st.append(100.0 * (rsi_vals[i] - lo) / (hi - lo))
-    k_raw = sma(st, k_len)
-    d = sma([0.0 if math.isnan(x) else x for x in k_raw], d_len)
-    k = [0.0 if math.isnan(x) else x for x in k_raw]
-    return k, d
-
-def wavetrend(close: List[float], channel_len: int, average_len: int, wt1_len: int, wt2_len: int) -> Tuple[List[float], List[float]]:
-    # Classic WT (approx):
-    # esa = EMA(price, channel_len)
-    # de  = EMA(|price-esa|, channel_len)
-    # ci  = (price-esa)/(0.015*de)
-    # wt1 = EMA(ci, average_len)
-    # wt2 = SMA(wt1, wt2_len)
-    price = close
-    esa = ema(price, channel_len)
-    abs_dev = [abs(p - e) for p, e in zip(price, esa)]
-    de = ema(abs_dev, channel_len)
-    ci = []
-    for p, e, d in zip(price, esa, de):
-        denom = 0.015 * d if d != 0 else 1e-9
-        ci.append((p - e) / denom)
-
-    wt1 = ema(ci, wt1_len)
-    wt2 = sma(wt1, wt2_len)
-    wt2 = [0.0 if math.isnan(x) else x for x in wt2]
-    return wt1, wt2
-
-def mfi(high: List[float], low: List[float], close: List[float], vol: List[float], length: int) -> List[float]:
-    tp = [(h + l + c) / 3.0 for h, l, c in zip(high, low, close)]
-    rmf = [tp[i] * vol[i] for i in range(len(tp))]
-    pos = [0.0]
-    neg = [0.0]
-    for i in range(1, len(tp)):
-        if tp[i] > tp[i - 1]:
-            pos.append(rmf[i])
-            neg.append(0.0)
-        elif tp[i] < tp[i - 1]:
-            pos.append(0.0)
-            neg.append(rmf[i])
-        else:
-            pos.append(0.0)
-            neg.append(0.0)
-
-    out = []
-    for i in range(len(tp)):
-        start = max(0, i - length + 1)
-        ps = sum(pos[start:i + 1])
-        ns = sum(neg[start:i + 1])
-        if ns == 0:
-            out.append(100.0)
-        else:
-            mr = ps / ns
-            out.append(100.0 - (100.0 / (1.0 + mr)))
-    return out
-
-def ema_cross_within(ema_f: List[float], ema_s: List[float], lookback: int, last_only: bool) -> bool:
-    # last_only: sadece son kapanan mumda kesişim (i = last_index)
-    # Binance klines son eleman bazen kapanmamış olur; USE_LAST_CANDLE=1 ise -2 kullanıyoruz.
-    idx_last = -2 if last_only else -1
-    if len(ema_f) < 3:
-        return False
-
-    if last_only:
-        i = len(ema_f) + idx_last
-        if i <= 0:
-            return False
-        return ema_f[i - 1] <= ema_s[i - 1] and ema_f[i] > ema_s[i]
-
-    # lookback içinde herhangi bir kesişim
-    end = len(ema_f) - 1  # son eleman
-    start = max(1, end - lookback + 1)
-    for i in range(start, end + 1):
-        if ema_f[i - 1] <= ema_s[i - 1] and ema_f[i] > ema_s[i]:
-            return True
-    return False
-
-def last_index_for_signals() -> int:
+def pick_idx(n: int) -> int:
+    if n < 3:
+        return -1
     return -2 if USE_LAST_CANDLE else -1
 
-# =========================
-# Filters
-# =========================
-def btc_ok() -> bool:
-    if not USE_BTC_FILTER:
-        return True
-    kl = get_klines(BTC_SYMBOL, BTC_TF, KLINE_LIMIT)
-    c, _, _ = closes_from_klines(kl)
-    e = ema(c, EMA_TREND)
-    i = last_index_for_signals()
-    return c[i] > e[i]
+def build_long_signal(symbol: str, closes: List[float], highs: List[float], lows: List[float]) -> Optional[Dict]:
+    idx = pick_idx(len(closes))
+    ema_f = ema(closes, EMA_FAST)
+    ema_s = ema(closes, EMA_SLOW)
+    r = rsi(closes, RSI_LEN)
 
-def htf_ok(symbol: str) -> bool:
-    if not USE_HTF_FILTER:
-        return True
-    kl = get_klines(symbol, HTF, KLINE_LIMIT)
-    c, _, _ = closes_from_klines(kl)
-    e = ema(c, EMA_TREND)
-    i = last_index_for_signals()
-    return c[i] > e[i]
+    hlc3 = [(highs[i] + lows[i] + closes[i]) / 3 for i in range(len(closes))]
+    wt1, wt2 = wavetrend(hlc3, WT_CH, WT_AVG) if USE_WT else ([0.0]*len(closes), [0.0]*len(closes))
 
-def vol_ok(symbol: str, kl: List[List]) -> bool:
-    if not USE_VOL_FILTER:
-        return True
-    c, _, _ = closes_from_klines(kl)
-    v = volumes_from_klines(kl)
-    vol_series = []
-    for i in range(len(v)):
-        vol_series.append(v[i] * c[i] if VOL_USE_QUOTE else v[i])
-    ma = sma(vol_series, VOL_LEN)
-    i = last_index_for_signals()
-    if math.isnan(ma[i]) or ma[i] == 0:
-        return False
-    return vol_series[i] >= ma[i] * VOL_MULT
+    k_line, d_line = stoch_rsi(closes, RSI_LEN, STOCH_RSI_LEN, STOCH_K, STOCH_D) if USE_STOCH_RSI else ([50.0]*len(closes), [50.0]*len(closes))
 
-def mfi_ok(kl: List[List]) -> bool:
-    if not USE_MFI_FILTER:
-        return True
-    c, h, l = closes_from_klines(kl)
-    v = volumes_from_klines(kl)
-    m = mfi(h, l, c, v, MFI_LEN)
-    i = last_index_for_signals()
-    if not (MFI_LONG_MIN <= m[i] <= MFI_LONG_MAX):
-        return False
-    if MFI_SLOPE_ENABLE:
-        b = max(1, MFI_SLOPE_BARS)
-        j = i - b
-        if j < 0:
-            return False
-        if m[i] <= m[j]:
-            return False
-    return True
+    i = idx
+    ip = idx - 1
+    price = closes[i]
 
-# =========================
-# Signal logic
-# =========================
-def entry_signal(symbol: str, kl: List[List]) -> Optional[Tuple[str, str]]:
-    """
-    Returns (kind, text) or None
-    kind: "WT_DIP" / "WT_CONT"
-    """
-    c, h, l = closes_from_klines(kl)
+    ema3 = ema_f[i]; ema44 = ema_s[i]
+    rsi_v = r[i]
+    st_k = k_line[i]; st_d = d_line[i]
+    wt1_v = wt1[i]; wt2_v = wt2[i]
+    wt1_p = wt1[ip]; wt2_p = wt2[ip]
 
-    # indicators
-    ef = ema(c, EMA_FAST)
-    es = ema(c, EMA_SLOW)
-    r = rsi(c, RSI_LEN)
-
-    k = d = None
-    if USE_STOCH_RSI:
-        k, d = stoch_rsi(r, STOCH_RSI_LEN, STOCH_K, STOCH_D)
-
-    wt1 = wt2 = None
-    if USE_WT:
-        wt1, wt2 = wavetrend(c, WT_CH, WT_AVG, WT_CH_LEN, WT_AVG_LEN)
-
-    i = last_index_for_signals()
-    ip = i - 1
-
-    # base filters
-    if r[i] < RSI_MIN:
+    if LONG_ONLY != 1:
+        return None
+    if rsi_v < RSI_MIN:
+        if DEBUG_REJECTS:
+            print(f"[REJ] {symbol} rsi {rsi_v:.2f} < {RSI_MIN}")
+        return None
+    if not ema_ok(ema3, ema44):
+        if DEBUG_REJECTS:
+            print(f"[REJ] {symbol} ema3 {ema3:.6f} < ema44 {ema44:.6f} (tol {EMA_TOL_PCT})")
         return None
 
-    # EMA cross condition: kesin TV setup yaklaşımı
-    crossed = ema_cross_within(ef, es, LOOKBACK, last_only=bool(USE_LAST_CANDLE))
-    if not crossed:
+    dip_ok = False
+    if USE_WT and USE_WT_DIP:
+        dip_ok = (
+            (wt1_v <= WT_OS1) and
+            cross_up(wt1_p, wt1_v, wt2_p, wt2_v) and
+            (st_k <= STOCH_OS and st_d <= STOCH_OS)
+        )
+
+    cont_ok = False
+    if USE_WT and USE_WT_CONTINUATION:
+        cont_ok = (
+            cross_up(wt1_p, wt1_v, wt2_p, wt2_v) and
+            (wt2_v <= WT_CONT_WT2_MAX) and
+            (st_k >= WT_CONT_STOCH_MIN) and
+            (rsi_v >= WT_CONT_RSI_MIN)
+        )
+
+    if not (dip_ok or cont_ok):
         return None
 
-    # Optional filters
-    if not vol_ok(symbol, kl):
+    sig_type = "WT_DIP" if dip_ok else "WT_CONT"
+    return {
+        "type": sig_type,
+        "symbol": symbol,
+        "price": price,
+        "ema_fast": ema3,
+        "ema_slow": ema44,
+        "rsi": rsi_v,
+        "stoch_k": st_k,
+        "stoch_d": st_d,
+        "wt1": wt1_v,
+        "wt2": wt2_v,
+    }
+
+def build_close_signal(symbol: str, closes: List[float], highs: List[float], lows: List[float]) -> Optional[Dict]:
+    if not (USE_WT and ENABLE_CLOSE):
         return None
-    if not mfi_ok(kl):
-        return None
-    if not htf_ok(symbol):
-        return None
+    idx = pick_idx(len(closes))
+    hlc3 = [(highs[i] + lows[i] + closes[i]) / 3 for i in range(len(closes))]
+    wt1, wt2 = wavetrend(hlc3, WT_CH, WT_AVG)
+    i = idx
+    ip = idx - 1
+    wt1_v = wt1[i]; wt2_v = wt2[i]
+    wt1_p = wt1[ip]; wt2_p = wt2[ip]
 
-    # WT + Stoch conditions
-    stoch_ok = True
-    if USE_STOCH_RSI and k is not None and d is not None:
-        # Dip için: K düşük ve yukarı dönüyor (K > D)
-        # Continuation için: K>20 ve momentum var (K > D)
-        stoch_ok = True  # aşağıda moda göre daha sıkı yapacağız
-
-    # --- WT DIP (dip reversal) ---
-    if USE_WT and USE_WT_DIP and wt1 is not None and wt2 is not None:
-        # deep oversold bölgesi + wt1 cross up wt2 + wt1 yükseliyor
-        dip_zone = (wt1[i] <= WT_OS2) or (wt1[ip] <= WT_OS2) or (wt1[i] <= WT_OS1)
-        cross_up = wt1[ip] < wt2[ip] and wt1[i] > wt2[i]
-        rising = wt1[i] > wt1[ip]
-
-        dip_stoch = True
-        if USE_STOCH_RSI and k is not None and d is not None:
-            dip_stoch = (k[i] < 25.0) and (k[i] > d[i])  # dipte dönüş
-
-        if dip_zone and cross_up and rising and dip_stoch:
-            return "WT_DIP", format_signal(symbol, c[i], ef[i], es[i], r[i], k[i] if k else None, d[i] if d else None, wt1[i], wt2[i])
-
-    # --- WT CONTINUATION (trend continuation) ---
-    if USE_WT and USE_WT_CONTINUATION and wt1 is not None and wt2 is not None:
-        # wt1 > wt2 ve yükseliyor; oversold değil (0 altına çok gömülmesin)
-        cont_ok = (wt1[i] > wt2[i]) and (wt1[i] > wt1[ip]) and (wt1[i] > -5.0)
-        cont_stoch = True
-        if USE_STOCH_RSI and k is not None and d is not None:
-            cont_stoch = (k[i] > 20.0) and (k[i] > d[i])
-
-        if cont_ok and cont_stoch:
-            return "WT_CONT", format_signal(symbol, c[i], ef[i], es[i], r[i], k[i] if k else None, d[i] if d else None, wt1[i], wt2[i])
-
+    ob_thr = WT_OB1 if CLOSE_STRICT_OB1 else WT_OB2
+    if cross_down(wt1_p, wt1_v, wt2_p, wt2_v) and (wt1_p >= ob_thr):
+        return {
+            "symbol": symbol,
+            "price": closes[i],
+            "wt1": wt1_v,
+            "wt2": wt2_v,
+            "wt1_prev": wt1_p,
+            "wt2_prev": wt2_p,
+            "ob_thr": ob_thr,
+        }
     return None
 
-def exit_signal(symbol: str, kl: List[List]) -> Optional[str]:
-    if not (USE_WT and USE_CLOSE_ALERT):
-        return None
-    c, _, _ = closes_from_klines(kl)
-    wt1, wt2 = wavetrend(c, WT_CH, WT_AVG, WT_CH_LEN, WT_AVG_LEN)
-    i = last_index_for_signals()
-    ip = i - 1
+def fmt_long_message(sig: Dict) -> str:
+    title = f"🚀 <b>LONG SIGNAL</b> <code>({sig['type']})</code>"
+    s = [
+        title,
+        f"Symbol: <b>{sig['symbol']}</b>",
+        f"TF: <b>{TF_ENTRY}</b> | HTF: <b>{HTF}</b>",
+        f"Price: <b>{sig['price']:.6f}</b>" if sig["price"] < 10 else f"Price: <b>{sig['price']:.4f}</b>",
+        "",
+        f"EMA{EMA_FAST}: {sig['ema_fast']:.6f} | EMA{EMA_SLOW}: {sig['ema_slow']:.6f}",
+        f"RSI({RSI_LEN}): {sig['rsi']:.2f}",
+        f"StochRSI K/D (K={STOCH_K},D={STOCH_D}): {sig['stoch_k']:.2f}/{sig['stoch_d']:.2f}",
+        f"WT (ch={WT_CH},avg={WT_AVG}) WT1/WT2: {sig['wt1']:.2f}/{sig['wt2']:.2f}",
+        "",
+        "<b>Exit plan (manual):</b>",
+        f"- TP1: +{TP_PCT:.1f}% (suggestion)",
+        f"- SL: -{SL_PCT:.1f}% (suggestion)",
+        f"- WT exit: if WT1 crosses DOWN WT2 while WT1>{WT_OB2:.0f} consider close/trim",
+        f"- WT warning: if WT1>{WT_OB1:.0f} and turns down -> tighten stop",
+    ]
+    return "\n".join(s)
 
-    # exit: WT1 crosses DOWN WT2 while WT1 > WT_OB2
-    if wt1[ip] > wt2[ip] and wt1[i] < wt2[i] and wt1[ip] > WT_OB2:
-        return format_close(symbol, c[i], wt1[i], wt2[i])
-    return None
+def fmt_close_message(sig: Dict) -> str:
+    return "\n".join([
+        "🧯 <b>CLOSE SIGNAL</b>",
+        f"Symbol: <b>{sig['symbol']}</b>",
+        f"TF: <b>{TF_ENTRY}</b>",
+        f"Price: <b>{sig['price']:.6f}</b>" if sig["price"] < 10 else f"Price: <b>{sig['price']:.4f}</b>",
+        "",
+        f"WT1/WT2: {sig['wt1']:.2f}/{sig['wt2']:.2f}",
+        f"Reason: WT1 crossed DOWN WT2 and previous WT1 ≥ {sig['ob_thr']:.0f}",
+    ])
 
-def format_signal(symbol: str, price: float, ema3: float, ema44: float, rsi_v: float,
-                  k: Optional[float], d: Optional[float], wt1: float, wt2: float) -> str:
-    stoch_line = ""
-    if k is not None and d is not None:
-        stoch_line = f"\nStochRSI K/D (K={STOCH_K},D={STOCH_D}): {k:.2f}/{d:.2f}"
-
-    msg = (
-        f"🚀 <b>LONG SIGNAL</b>\n"
-        f"Symbol: <b>{symbol}</b>\n"
-        f"TF: {TF_ENTRY}"
-        f"\nPrice: {price:.6f}\n\n"
-        f"EMA{EMA_FAST}: {ema3:.6f} | EMA{EMA_SLOW}: {ema44:.6f}\n"
-        f"RSI({RSI_LEN}): {rsi_v:.2f}"
-        f"{stoch_line}\n"
-        f"WT (ch={WT_CH},avg={WT_AVG}) WT1/WT2: {wt1:.2f}/{wt2:.2f}\n\n"
-        f"<b>Exit plan (manual)</b>\n"
-        f"- TP1: +{TP_PCT:.1f}% (suggestion)\n"
-        f"- SL: -{SL_PCT:.1f}% (suggestion)\n"
-        f"- WT exit: if WT1 crosses DOWN WT2 while WT1>{WT_OB2:.0f} consider close/trim\n"
-        f"- WT warning: if WT1>{WT_OB1:.0f} and turns down -> tighten stop"
-    )
-    return msg
-
-def format_close(symbol: str, price: float, wt1: float, wt2: float) -> str:
-    return (
-        f"🧯 <b>CLOSE SIGNAL</b>\n"
-        f"Symbol: <b>{symbol}</b>\n"
-        f"TF: {TF_ENTRY}\n"
-        f"Price: {price:.6f}\n\n"
-        f"WT1/WT2: {wt1:.2f}/{wt2:.2f}\n"
-        f"Reason: WT1 crossed DOWN WT2 while WT1>{WT_OB2:.0f}"
-    )
-
+# =========================
+# MAIN LOOP
+# =========================
 def main() -> None:
     storage = Storage(STORAGE_PATH) if USE_STORAGE else None
+    if storage:
+        storage.load()
 
-    log(f"{ts_now()} [BOOT] Futures scanner started")
-    log(f"{ts_now()} [CFG] TF_ENTRY={TF_ENTRY} EMA={EMA_FAST}/{EMA_SLOW} LOOKBACK={LOOKBACK} RSI_LEN={RSI_LEN} RSI_MIN={RSI_MIN} WT={USE_WT} DIP={USE_WT_DIP} CONT={USE_WT_CONTINUATION} STOCH_RSI={USE_STOCH_RSI}")
-    log(f"{ts_now()} [CFG] TOP_N={TOP_N} MIN_QUOTE_VOLUME={MIN_QUOTE_VOLUME} COOLDOWN_SEC={COOLDOWN_SEC} DRY_RUN={DRY_RUN} USE_LAST_CANDLE={USE_LAST_CANDLE}")
-    log(f"{ts_now()} [CFG] STORAGE_PATH={STORAGE_PATH}")
+    last_heartbeat = 0.0
 
-    last_heartbeat = 0
+    if DEBUG:
+        print("[BOOT] Futures scanner started")
+        print(f"[CFG] TF_ENTRY={TF_ENTRY} EMA={EMA_FAST}/{EMA_SLOW} LOOKBACK={LOOKBACK} RSI_LEN={RSI_LEN} RSI_MIN={RSI_MIN} WT={USE_WT} DIP={USE_WT_DIP} CONT={USE_WT_CONTINUATION} STOCH_RSI={USE_STOCH_RSI}")
+        print(f"[CFG] TOP_N={TOP_N} MIN_QUOTE_VOLUME={MIN_QUOTE_VOLUME} COOLDOWN_SEC={COOLDOWN_SEC} DRY_RUN={DRY_RUN} USE_LAST_CANDLE={USE_LAST_CANDLE}")
+        print(f"[CFG] STORAGE_PATH={STORAGE_PATH}")
 
-    # preload symbols list
-    all_symbols = get_futures_symbols()
-    top_symbols = top_by_quote_volume(all_symbols, TOP_N)
+    all_syms = get_usdt_perp_symbols()
+    watch = get_top_symbols_by_quote_volume(all_syms, TOP_N)
+
+    if DEBUG:
+        print(f"[INFO] symbols in universe: {len(all_syms)} | watching: {len(watch)}")
 
     while True:
-        now = int(time.time())
-
-        # heartbeat
-        if now - last_heartbeat >= HEARTBEAT_SEC:
-            hb = f"✅ worker alive | TF={TF_ENTRY} TOP_N={TOP_N} DIP={USE_WT_DIP} CONT={USE_WT_CONTINUATION}"
-            send_telegram(TG_BOT_TOKEN, TG_CHAT_ID, hb, dry_run=bool(DRY_RUN), timeout=HTTP_TIMEOUT)
+        now = time.time()
+        if (now - last_heartbeat) >= HEARTBEAT_SEC:
+            send_telegram(f"✅ worker alive | TF={TF_ENTRY} TOP_N={TOP_N} DIP={USE_WT_DIP} CONT={USE_WT_CONTINUATION}")
             last_heartbeat = now
 
-        # BTC filter once per cycle (cheap)
-        if not btc_ok():
-            if DEBUG_REJECTS:
-                log(f"{ts_now()} [BTC] filter reject")
-            time.sleep(INTERVAL_SEC)
-            if TEST_ONCE:
-                break
-            continue
-
-        rejects: Dict[str, int] = {}
-
-        # open positions exit scan
-        if storage and USE_CLOSE_ALERT:
-            open_map = storage.get_open()
-            for sym in list(open_map.keys()):
-                try:
-                    kl = get_klines(sym, TF_ENTRY, KLINE_LIMIT)
-                    ex = exit_signal(sym, kl)
-                    if ex:
-                        key = f"{sym}:CLOSE"
-                        if not storage.is_cooldown(key, int(COOLDOWN_SEC / 3)):
-                            send_telegram(TG_BOT_TOKEN, TG_CHAT_ID, ex, dry_run=bool(DRY_RUN), timeout=HTTP_TIMEOUT)
-                            storage.mark_sent(key)
-                        storage.clear_open(sym)
-                except Exception as e:
-                    log(f"{ts_now()} [EXIT_ERR] {sym}: {e}")
-
-        # entry scan
-        for sym, qv in top_symbols:
+        for sym in watch:
             try:
-                if qv < MIN_QUOTE_VOLUME:
-                    reject(rejects, "LOW_QUOTE_VOL")
-                    continue
-
                 kl = get_klines(sym, TF_ENTRY, KLINE_LIMIT)
-
-                sig = entry_signal(sym, kl)
-                if not sig:
-                    reject(rejects, "NO_SIGNAL")
+                if not kl or len(kl) < 50:
                     continue
+                o, h, l, c, v = klines_to_ohlc(kl)
 
-                kind, msg = sig
-                # başlığa sinyal tipi ekleyelim
-                msg = msg.replace("🚀 <b>LONG SIGNAL</b>", f"🚀 <b>LONG SIGNAL ({kind})</b>")
+                sig = build_long_signal(sym, c, h, l)
+                if sig:
+                    if storage and storage.is_cooldown(sym, "entry", COOLDOWN_SEC):
+                        continue
+                    send_telegram(fmt_long_message(sig))
+                    if storage:
+                        storage.touch(sym, "entry")
+                        storage.save()
 
-                # cooldown key
-                key = f"{sym}:{kind}"
-                if storage and storage.is_cooldown(key, COOLDOWN_SEC):
-                    reject(rejects, "COOLDOWN")
-                    continue
-
-                send_telegram(TG_BOT_TOKEN, TG_CHAT_ID, msg, dry_run=bool(DRY_RUN), timeout=HTTP_TIMEOUT)
-
-                if storage:
-                    storage.mark_sent(key)
-                    storage.set_open(sym, kind)
+                cs = build_close_signal(sym, c, h, l)
+                if cs:
+                    if storage and storage.is_cooldown(sym, "close", CLOSE_COOLDOWN_SEC):
+                        continue
+                    send_telegram(fmt_close_message(cs))
+                    if storage:
+                        storage.touch(sym, "close")
+                        storage.save()
 
             except Exception as e:
-                log(f"{ts_now()} [ERR] {sym}: {e}")
-
-        if DEBUG_REJECTS and rejects:
-            log(f"{ts_now()} [REJECTS] {rejects}")
+                if DEBUG:
+                    print(f"[ERR] {sym} -> {repr(e)}")
+                continue
 
         if TEST_ONCE:
             break
-
         time.sleep(INTERVAL_SEC)
 
 if __name__ == "__main__":
