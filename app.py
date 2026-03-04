@@ -28,6 +28,9 @@ TEST_ONCE = int(os.getenv("TEST_ONCE", "0"))
 DRY_RUN = int(os.getenv("DRY_RUN", "0"))
 HEARTBEAT_SEC = int(os.getenv("HEARTBEAT_SEC", "900"))
 
+# NEW: refresh watchlist periodically (in seconds). 1800 = 30 minutes
+WATCH_REFRESH_SEC = int(os.getenv("WATCH_REFRESH_SEC", "1800"))
+
 # If 1 -> evaluate signals on the LAST CLOSED candle (safer)
 USE_LAST_CANDLE = int(os.getenv("USE_LAST_CANDLE", "1"))
 
@@ -429,20 +432,39 @@ def main() -> None:
         print("[BOOT] Futures scanner started")
         print(f"[CFG] TF_ENTRY={TF_ENTRY} EMA={EMA_FAST}/{EMA_SLOW} LOOKBACK={LOOKBACK} RSI_LEN={RSI_LEN} RSI_MIN={RSI_MIN} WT={USE_WT} DIP={USE_WT_DIP} CONT={USE_WT_CONTINUATION} STOCH_RSI={USE_STOCH_RSI}")
         print(f"[CFG] TOP_N={TOP_N} MIN_QUOTE_VOLUME={MIN_QUOTE_VOLUME} COOLDOWN_SEC={COOLDOWN_SEC} DRY_RUN={DRY_RUN} USE_LAST_CANDLE={USE_LAST_CANDLE}")
+        print(f"[CFG] WATCH_REFRESH_SEC={WATCH_REFRESH_SEC} INTERVAL_SEC={INTERVAL_SEC} HEARTBEAT_SEC={HEARTBEAT_SEC}")
         print(f"[CFG] STORAGE_PATH={STORAGE_PATH}")
 
+    # initial universe + watchlist
     all_syms = get_usdt_perp_symbols()
     watch = get_top_symbols_by_quote_volume(all_syms, TOP_N)
+    last_watch_refresh = time.time()
 
     if DEBUG:
         print(f"[INFO] symbols in universe: {len(all_syms)} | watching: {len(watch)}")
 
     while True:
         now = time.time()
+
+        # heartbeat
         if (now - last_heartbeat) >= HEARTBEAT_SEC:
             send_telegram(f"✅ worker alive | TF={TF_ENTRY} TOP_N={TOP_N} DIP={USE_WT_DIP} CONT={USE_WT_CONTINUATION}")
             last_heartbeat = now
 
+        # NEW: refresh watchlist periodically (does NOT change strategy, only updates universe)
+        if WATCH_REFRESH_SEC > 0 and (now - last_watch_refresh) >= WATCH_REFRESH_SEC:
+            try:
+                all_syms = get_usdt_perp_symbols()
+                watch = get_top_symbols_by_quote_volume(all_syms, TOP_N)
+                last_watch_refresh = now
+                if DEBUG:
+                    print(f"[INFO] watchlist refreshed | universe={len(all_syms)} watching={len(watch)} TOP_N={TOP_N}")
+                send_telegram(f"🔄 watchlist refreshed | TOP_N={TOP_N} watching={len(watch)} TF={TF_ENTRY}")
+            except Exception as e:
+                if DEBUG:
+                    print("[ERR] watchlist refresh failed:", repr(e))
+
+        # scan
         for sym in watch:
             try:
                 kl = get_klines(sym, TF_ENTRY, KLINE_LIMIT)
