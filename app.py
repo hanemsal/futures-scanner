@@ -1,503 +1,644 @@
-#!/usr/bin/env python3
+# app.py
 import os
-import json
 import time
-from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Optional
+import math
+import json
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Tuple
 
 import requests
 
+from notify import send_telegram
+from storage import Storage
+
+# =========================
+# ENV / AYARLAR
+# =========================
 BINANCE_FAPI = os.getenv("BINANCE_FAPI", "https://fapi.binance.com").rstrip("/")
 
-# =========================
-# GENERAL
-# =========================
-TF_ENTRY = os.getenv("TF_ENTRY", "1h")          # entry timeframe
-HTF = os.getenv("HTF", "4h")                    # higher timeframe (optional, currently only used in message header)
+TF = os.getenv("TF", "30m")  # Sinyal timeframe
 INTERVAL_SEC = int(os.getenv("INTERVAL_SEC", "600"))
-HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "12"))
-KLINE_LIMIT = int(os.getenv("KLINE_LIMIT", "260"))
-TOP_N = int(os.getenv("TOP_N", "200"))
-MIN_QUOTE_VOLUME = float(os.getenv("MIN_QUOTE_VOLUME", "3000000"))
-ONLY_USDT_PERP = int(os.getenv("ONLY_USDT_PERP", "1"))
-LONG_ONLY = int(os.getenv("LONG_ONLY", "1"))
+KLINE_LIMIT = int(os.getenv("KLINE_LIMIT", "200"))
 
-DEBUG = int(os.getenv("DEBUG", "1"))
-DEBUG_REJECTS = int(os.getenv("DEBUG_REJECTS", "0"))
-TEST_ONCE = int(os.getenv("TEST_ONCE", "0"))
-DRY_RUN = int(os.getenv("DRY_RUN", "0"))
-HEARTBEAT_SEC = int(os.getenv("HEARTBEAT_SEC", "900"))
+# Trend Indicator A (v2.3) yaklaşımı:
+# Heikin Ashi + EMA(len=9) -> renk: HA close EMA üstü bullish, altı bearish
+USE_HEIKIN_ASHI = int(os.getenv("USE_HEIKIN_ASHI", "1")) == 1
+TREND_MA_TYPE = os.getenv("TREND_MA_TYPE", "EMA").upper()
+TREND_MA_LEN = int(os.getenv("TREND_MA_LEN", "9"))
+TREND_CONFIRM_CLOSE = int(os.getenv("TREND_CONFIRM_CLOSE", "1")) == 1  # candle close ile onay
 
-# NEW: refresh watchlist periodically (in seconds). 1800 = 30 minutes
-WATCH_REFRESH_SEC = int(os.getenv("WATCH_REFRESH_SEC", "1800"))
-
-# If 1 -> evaluate signals on the LAST CLOSED candle (safer)
-USE_LAST_CANDLE = int(os.getenv("USE_LAST_CANDLE", "1"))
-
-# =========================
-# TELEGRAM
-# =========================
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
-TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
-
-def send_telegram(text: str) -> None:
-    """Minimal telegram sender (no external notify.py dependency)."""
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        if DEBUG:
-            print("[WARN] TG_BOT_TOKEN / TG_CHAT_ID missing; message skipped.")
-        return
-    if DRY_RUN:
-        print("[DRY_RUN] Would send:\n", text)
-        return
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TG_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-    try:
-        r = requests.post(url, json=payload, timeout=HTTP_TIMEOUT)
-        if r.status_code != 200:
-            print("[ERR] Telegram send failed:", r.status_code, r.text[:500])
-    except Exception as e:
-        print("[ERR] Telegram exception:", repr(e))
-
-# =========================
-# STORAGE (cooldown + dedupe)
-# =========================
-STORAGE_PATH = os.getenv("STORAGE_PATH", "/var/data/futures_state.json")
-USE_STORAGE = int(os.getenv("USE_STORAGE", "1"))
-COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "21600"))  # 6 hours default
-
-@dataclass
-class Storage:
-    path: str
-    data: Dict[str, Dict[str, float]] = field(default_factory=dict)
-
-    def load(self) -> None:
-        try:
-            with open(self.path, "r", encoding="utf-8") as f:
-                self.data = json.load(f) or {}
-        except FileNotFoundError:
-            self.data = {}
-        except Exception:
-            self.data = {}
-
-    def save(self) -> None:
-        try:
-            os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        except Exception:
-            pass
-        try:
-            with open(self.path, "w", encoding="utf-8") as f:
-                json.dump(self.data, f)
-        except Exception:
-            pass
-
-    def _get(self, sym: str) -> Dict[str, float]:
-        if sym not in self.data or not isinstance(self.data.get(sym), dict):
-            self.data[sym] = {}
-        return self.data[sym]
-
-    def is_cooldown(self, sym: str, key: str, cooldown_sec: int) -> bool:
-        """key: 'entry' or 'close' etc."""
-        now = time.time()
-        d = self._get(sym)
-        last = float(d.get(f"last_{key}_ts", 0.0))
-        return (now - last) < cooldown_sec
-
-    def touch(self, sym: str, key: str) -> None:
-        d = self._get(sym)
-        d[f"last_{key}_ts"] = time.time()
-
-# =========================
-# INDICATORS
-# =========================
-def ema(values: List[float], length: int) -> List[float]:
-    if length <= 1:
-        return values[:]
-    k = 2 / (length + 1)
-    out = []
-    prev = values[0]
-    out.append(prev)
-    for v in values[1:]:
-        prev = v * k + prev * (1 - k)
-        out.append(prev)
-    return out
-
-def rsi(values: List[float], length: int) -> List[float]:
-    if length <= 1 or len(values) < length + 1:
-        return [50.0] * len(values)
-    gains = [0.0]
-    losses = [0.0]
-    for i in range(1, len(values)):
-        ch = values[i] - values[i - 1]
-        gains.append(max(ch, 0.0))
-        losses.append(max(-ch, 0.0))
-    avg_gain = sum(gains[1:length+1]) / length
-    avg_loss = sum(losses[1:length+1]) / length
-    out = [50.0] * (length)  # seed
-    rs = (avg_gain / avg_loss) if avg_loss != 0 else 999999.0
-    out.append(100 - (100 / (1 + rs)))
-    for i in range(length + 1, len(values)):
-        avg_gain = (avg_gain * (length - 1) + gains[i]) / length
-        avg_loss = (avg_loss * (length - 1) + losses[i]) / length
-        rs = (avg_gain / avg_loss) if avg_loss != 0 else 999999.0
-        out.append(100 - (100 / (1 + rs)))
-    if len(out) < len(values):
-        out = out + [out[-1]] * (len(values) - len(out))
-    return out[:len(values)]
-
-def sma(values: List[float], length: int) -> List[float]:
-    if length <= 1:
-        return values[:]
-    out = []
-    s = 0.0
-    for i, v in enumerate(values):
-        s += v
-        if i >= length:
-            s -= values[i - length]
-        if i >= length - 1:
-            out.append(s / length)
-        else:
-            out.append(v)
-    return out
-
-def stoch_rsi(values: List[float], rsi_len: int, stoch_len: int, k: int, d: int) -> Tuple[List[float], List[float]]:
-    r = rsi(values, rsi_len)
-    stoch = []
-    for i in range(len(r)):
-        lo = min(r[max(0, i - stoch_len + 1): i + 1])
-        hi = max(r[max(0, i - stoch_len + 1): i + 1])
-        if hi - lo == 0:
-            stoch.append(50.0)
-        else:
-            stoch.append(100 * (r[i] - lo) / (hi - lo))
-    k_line = sma(stoch, k)
-    d_line = sma(k_line, d)
-    return k_line, d_line
-
-def wavetrend(hlc3: List[float], ch_len: int, avg_len: int) -> Tuple[List[float], List[float]]:
-    esa = ema(hlc3, ch_len)
-    abs_diff = [abs(hlc3[i] - esa[i]) for i in range(len(hlc3))]
-    d = ema(abs_diff, ch_len)
-    ci = []
-    for i in range(len(hlc3)):
-        denom = 0.015 * d[i] if d[i] != 0 else 1e-9
-        ci.append((hlc3[i] - esa[i]) / denom)
-    wt1 = ema(ci, avg_len)
-    wt2 = sma(wt1, 4)
-    return wt1, wt2
-
-def cross_up(a_prev: float, a: float, b_prev: float, b: float) -> bool:
-    return a_prev <= b_prev and a > b
-
-def cross_down(a_prev: float, a: float, b_prev: float, b: float) -> bool:
-    return a_prev >= b_prev and a < b
-
-# =========================
-# STRATEGY PARAMS
-# =========================
-EMA_FAST = int(os.getenv("EMA_FAST", "3"))
-EMA_SLOW = int(os.getenv("EMA_SLOW", "44"))
-EMA_TOL_PCT = float(os.getenv("EMA_TOL_PCT", "0.002"))  # 0.2% tolerance
-
-RSI_LEN = int(os.getenv("RSI_LEN", "21"))
+# RSI
+RSI_LEN = int(os.getenv("RSI_LEN", "14"))
 RSI_MIN = float(os.getenv("RSI_MIN", "42"))
+RSI_CROSS_CONFIRM = int(os.getenv("RSI_CROSS_CONFIRM", "1")) == 1
+RSI_MA_LEN = int(os.getenv("RSI_MA_LEN", "14"))  # mor (RSI) sarıyı (RSI MA) kessin
 
-USE_STOCH_RSI = int(os.getenv("USE_STOCH_RSI", "1"))
-STOCH_RSI_LEN = int(os.getenv("STOCH_RSI_LEN", "14"))
-STOCH_K = int(os.getenv("STOCH_K", "5"))
-STOCH_D = int(os.getenv("STOCH_D", "5"))
-STOCH_OS = float(os.getenv("STOCH_OS", "20"))
-STOCH_OB = float(os.getenv("STOCH_OB", "80"))
+# MACD
+MACD_FAST = int(os.getenv("MACD_FAST", "12"))
+MACD_SLOW = int(os.getenv("MACD_SLOW", "26"))
+MACD_SIGNAL = int(os.getenv("MACD_SIGNAL", "9"))
+MACD_CROSS_CONFIRM = int(os.getenv("MACD_CROSS_CONFIRM", "1")) == 1
+MACD_ZERO_FILTER = int(os.getenv("MACD_ZERO_FILTER", "0")) == 1
+MACD_ZERO_EPS = float(os.getenv("MACD_ZERO_EPS", "0.02"))  # 0'a yakın tolerans
 
-USE_WT = int(os.getenv("USE_WT", "1"))
-WT_CH = int(os.getenv("WT_CH", "12"))
-WT_AVG = int(os.getenv("WT_AVG", "12"))
-WT_OS1 = float(os.getenv("WT_OS1", "-60"))
-WT_OS2 = float(os.getenv("WT_OS2", "-53"))
-WT_OB1 = float(os.getenv("WT_OB1", "60"))
-WT_OB2 = float(os.getenv("WT_OB2", "53"))
+# ATR / TP-SL
+ATR_LEN = int(os.getenv("ATR_LEN", "14"))
+ATR_SL_MULT = float(os.getenv("ATR_SL_MULT", "1.5"))
+TP1_ATR_MULT = float(os.getenv("TP1_ATR_MULT", "1.0"))
+TP2_ATR_MULT = float(os.getenv("TP2_ATR_MULT", "2.0"))
 
-LOOKBACK = int(os.getenv("LOOKBACK", "6"))
+# PSAR
+USE_PARABOLIC_SAR = int(os.getenv("USE_PARABOLIC_SAR", "1")) == 1
+PSAR_AF_STEP = float(os.getenv("PSAR_AF_STEP", "0.02"))
+PSAR_AF_MAX = float(os.getenv("PSAR_AF_MAX", "0.2"))
 
-USE_WT_DIP = int(os.getenv("USE_WT_DIP", "1"))
-USE_WT_CONTINUATION = int(os.getenv("USE_WT_CONTINUATION", "1"))
+# Tarama evreni
+SCAN_ALL_USDT_PERPS = int(os.getenv("SCAN_ALL_USDT_PERPS", "1")) == 1
 
-WT_CONT_WT2_MAX = float(os.getenv("WT_CONT_WT2_MAX", "-35"))
-WT_CONT_STOCH_MIN = float(os.getenv("WT_CONT_STOCH_MIN", "60"))
-WT_CONT_RSI_MIN = float(os.getenv("WT_CONT_RSI_MIN", "50"))
+# 24h Volume filter (default kapalı)
+USE_24H_VOLUME_FILTER = int(os.getenv("USE_24H_VOLUME_FILTER", "0")) == 1
+MIN_QUOTE_VOLUME_24H = float(os.getenv("MIN_QUOTE_VOLUME_24H", "3000000"))
 
-ENABLE_CLOSE = int(os.getenv("ENABLE_CLOSE", "1"))
-CLOSE_STRICT_OB1 = int(os.getenv("CLOSE_STRICT_OB1", "0"))
-CLOSE_COOLDOWN_SEC = int(os.getenv("CLOSE_COOLDOWN_SEC", str(COOLDOWN_SEC)))
+# BTC filtresi (default kapalı)
+USE_BTC_FILTER = int(os.getenv("USE_BTC_FILTER", "0")) == 1
+BTC_SYMBOL = os.getenv("BTC_SYMBOL", "BTCUSDT")
+BTC_TF = os.getenv("BTC_TF", "1h")
+BTC_RSI_MIN = float(os.getenv("BTC_RSI_MIN", "42"))
 
-TP_PCT = float(os.getenv("TP_PCT", "8"))
-SL_PCT = float(os.getenv("SL_PCT", "2"))
+# Multi-timeframe RSI prefilter (LONG için oversold seçimi)
+# Senin kilitlediğin: 1M<=10, 1W<=20, 1D<=30, 4H<=30, 1H<=30
+USE_MTF_RSI_PREFILTER = int(os.getenv("USE_MTF_RSI_PREFILTER", "1")) == 1
+MTF_RSI_1M_MAX = float(os.getenv("MTF_RSI_1M_MAX", "10"))
+MTF_RSI_1W_MAX = float(os.getenv("MTF_RSI_1W_MAX", "20"))
+MTF_RSI_1D_MAX = float(os.getenv("MTF_RSI_1D_MAX", "30"))
+MTF_RSI_4H_MAX = float(os.getenv("MTF_RSI_4H_MAX", "30"))
+MTF_RSI_1H_MAX = float(os.getenv("MTF_RSI_1H_MAX", "30"))
+
+# Cooldown / tekrar engelleme
+COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "0"))  # 0 = kapalı
+CLOSE_COOLDOWN_SEC = int(os.getenv("CLOSE_COOLDOWN_SEC", "0"))  # şimdilik kapalı
+STORAGE_PATH = os.getenv("STORAGE_PATH", "/tmp/futures_scanner_storage.json")
+
+# Debug
+DEBUG = int(os.getenv("DEBUG", "1")) == 1
+DEBUG_REJECTS = int(os.getenv("DEBUG_REJECTS", "0")) == 1
+DRY_RUN = int(os.getenv("DRY_RUN", "0")) == 1
+
+# Hız / oran limit
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "15"))
+SYMBOL_SLEEP_SEC = float(os.getenv("SYMBOL_SLEEP_SEC", "0.05"))  # rate limit için
+MAX_SYMBOLS_PER_CYCLE = int(os.getenv("MAX_SYMBOLS_PER_CYCLE", "0"))  # 0 = sınırsız (tüm Binance futures)
+
+# Telegram
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # =========================
-# BINANCE API
+# HTTP Helpers
 # =========================
-def http_get(path: str, params: Optional[Dict] = None):
+sess = requests.Session()
+
+
+def http_get(path: str, params: Optional[dict] = None):
     url = f"{BINANCE_FAPI}{path}"
-    r = requests.get(url, params=params or {}, timeout=HTTP_TIMEOUT)
+    r = sess.get(url, params=params or {}, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
     return r.json()
 
-def get_usdt_perp_symbols() -> List[str]:
+
+def get_klines(symbol: str, interval: str, limit: int = 200):
+    return http_get("/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit})
+
+
+def get_exchange_symbols_usdt_perp() -> List[str]:
     info = http_get("/fapi/v1/exchangeInfo")
     out = []
     for s in info.get("symbols", []):
         if s.get("status") != "TRADING":
             continue
-        if ONLY_USDT_PERP:
-            if s.get("quoteAsset") != "USDT":
-                continue
-            if s.get("contractType") != "PERPETUAL":
-                continue
-        out.append(s.get("symbol"))
+        if s.get("contractType") != "PERPETUAL":
+            continue
+        if s.get("quoteAsset") != "USDT":
+            continue
+        # Binance USDT perpetual format: XXXUSDT
+        sym = s.get("symbol")
+        if not sym or not sym.endswith("USDT"):
+            continue
+        out.append(sym)
     return out
 
-def get_top_symbols_by_quote_volume(symbols: List[str], top_n: int) -> List[str]:
-    tickers = http_get("/fapi/v1/ticker/24hr")
-    vol_map = {}
-    for t in tickers:
-        sym = t.get("symbol")
-        if sym not in symbols:
+
+def get_24h_quote_volumes() -> Dict[str, float]:
+    # /fapi/v1/ticker/24hr returns list
+    data = http_get("/fapi/v1/ticker/24hr")
+    vols = {}
+    for x in data:
+        sym = x.get("symbol")
+        if not sym:
             continue
+        # quoteVolume is in quote asset (USDT)
+        qv = x.get("quoteVolume")
         try:
-            qv = float(t.get("quoteVolume", 0.0))
+            vols[sym] = float(qv)
         except Exception:
-            qv = 0.0
-        vol_map[sym] = qv
-    filt = [(s, vol_map.get(s, 0.0)) for s in symbols if vol_map.get(s, 0.0) >= MIN_QUOTE_VOLUME]
-    filt.sort(key=lambda x: x[1], reverse=True)
-    return [s for s, _ in filt[:top_n]]
+            continue
+    return vols
 
-def get_klines(symbol: str, interval: str, limit: int) -> List[List]:
-    return http_get("/fapi/v1/klines", params={"symbol": symbol, "interval": interval, "limit": limit})
-
-def klines_to_ohlc(kl: List[List]) -> Tuple[List[float], List[float], List[float], List[float], List[float]]:
-    o, h, l, c, v = [], [], [], [], []
-    for k in kl:
-        o.append(float(k[1])); h.append(float(k[2])); l.append(float(k[3])); c.append(float(k[4])); v.append(float(k[5]))
-    return o, h, l, c, v
 
 # =========================
-# SIGNAL LOGIC
+# Indicator math
 # =========================
-def ema_ok(ema_fast_val: float, ema_slow_val: float) -> bool:
-    return ema_fast_val >= ema_slow_val * (1 - EMA_TOL_PCT)
+def ema(values: List[float], length: int) -> List[float]:
+    if length <= 1:
+        return values[:]
+    out = []
+    k = 2 / (length + 1)
+    e = None
+    for v in values:
+        if e is None:
+            e = v
+        else:
+            e = v * k + e * (1 - k)
+        out.append(e)
+    return out
 
-def pick_idx(n: int) -> int:
+
+def sma(values: List[float], length: int) -> List[Optional[float]]:
+    out: List[Optional[float]] = []
+    if length <= 0:
+        return [None] * len(values)
+    s = 0.0
+    q: List[float] = []
+    for v in values:
+        q.append(v)
+        s += v
+        if len(q) > length:
+            s -= q.pop(0)
+        if len(q) == length:
+            out.append(s / length)
+        else:
+            out.append(None)
+    return out
+
+
+def rsi(close: List[float], length: int) -> List[Optional[float]]:
+    if length <= 0 or len(close) < length + 1:
+        return [None] * len(close)
+    gains = [0.0]
+    losses = [0.0]
+    for i in range(1, len(close)):
+        ch = close[i] - close[i - 1]
+        gains.append(max(ch, 0.0))
+        losses.append(max(-ch, 0.0))
+
+    avg_gain = None
+    avg_loss = None
+    out: List[Optional[float]] = [None] * len(close)
+
+    for i in range(1, len(close)):
+        if i < length:
+            continue
+        if i == length:
+            avg_gain = sum(gains[1:length + 1]) / length
+            avg_loss = sum(losses[1:length + 1]) / length
+        else:
+            assert avg_gain is not None and avg_loss is not None
+            avg_gain = (avg_gain * (length - 1) + gains[i]) / length
+            avg_loss = (avg_loss * (length - 1) + losses[i]) / length
+
+        if avg_loss == 0:
+            out[i] = 100.0
+        else:
+            rs = avg_gain / avg_loss
+            out[i] = 100.0 - (100.0 / (1.0 + rs))
+    return out
+
+
+def macd(close: List[float], fast: int, slow: int, signal: int) -> Tuple[List[float], List[float], List[float]]:
+    ema_fast = ema(close, fast)
+    ema_slow = ema(close, slow)
+    macd_line = [a - b for a, b in zip(ema_fast, ema_slow)]
+    signal_line = ema(macd_line, signal)
+    hist = [m - s for m, s in zip(macd_line, signal_line)]
+    return macd_line, signal_line, hist
+
+
+def true_range(high: List[float], low: List[float], close: List[float]) -> List[float]:
+    tr = [high[0] - low[0]]
+    for i in range(1, len(close)):
+        tr.append(max(high[i] - low[i], abs(high[i] - close[i - 1]), abs(low[i] - close[i - 1])))
+    return tr
+
+
+def atr(high: List[float], low: List[float], close: List[float], length: int) -> List[Optional[float]]:
+    if len(close) < length + 1:
+        return [None] * len(close)
+    tr = true_range(high, low, close)
+    # Wilder smoothing
+    out: List[Optional[float]] = [None] * len(close)
+    atr_val = None
+    for i in range(len(close)):
+        if i < length:
+            continue
+        if i == length:
+            atr_val = sum(tr[1:length + 1]) / length
+        else:
+            assert atr_val is not None
+            atr_val = (atr_val * (length - 1) + tr[i]) / length
+        out[i] = atr_val
+    return out
+
+
+def heikin_ashi(ohlc: List[Tuple[float, float, float, float]]) -> List[Tuple[float, float, float, float]]:
+    # returns HA (open, high, low, close)
+    ha = []
+    prev_ha_open = None
+    prev_ha_close = None
+    for i, (o, h, l, c) in enumerate(ohlc):
+        ha_close = (o + h + l + c) / 4.0
+        if prev_ha_open is None:
+            ha_open = (o + c) / 2.0
+        else:
+            ha_open = (prev_ha_open + prev_ha_close) / 2.0
+        ha_high = max(h, ha_open, ha_close)
+        ha_low = min(l, ha_open, ha_close)
+        ha.append((ha_open, ha_high, ha_low, ha_close))
+        prev_ha_open, prev_ha_close = ha_open, ha_close
+    return ha
+
+
+def psar(high: List[float], low: List[float], step: float = 0.02, max_af: float = 0.2) -> List[Optional[float]]:
+    # Basic Parabolic SAR implementation
+    n = len(high)
     if n < 3:
-        return -1
-    return -2 if USE_LAST_CANDLE else -1
+        return [None] * n
 
-def build_long_signal(symbol: str, closes: List[float], highs: List[float], lows: List[float]) -> Optional[Dict]:
-    idx = pick_idx(len(closes))
-    ema_f = ema(closes, EMA_FAST)
-    ema_s = ema(closes, EMA_SLOW)
-    r = rsi(closes, RSI_LEN)
+    sar: List[Optional[float]] = [None] * n
 
-    hlc3 = [(highs[i] + lows[i] + closes[i]) / 3 for i in range(len(closes))]
-    wt1, wt2 = wavetrend(hlc3, WT_CH, WT_AVG) if USE_WT else ([0.0]*len(closes), [0.0]*len(closes))
+    # initial trend
+    up = high[1] > high[0]
+    ep = high[1] if up else low[1]
+    af = step
+    sar[1] = low[0] if up else high[0]
 
-    k_line, d_line = stoch_rsi(closes, RSI_LEN, STOCH_RSI_LEN, STOCH_K, STOCH_D) if USE_STOCH_RSI else ([50.0]*len(closes), [50.0]*len(closes))
+    for i in range(2, n):
+        prev_sar = sar[i - 1]
+        if prev_sar is None:
+            sar[i] = None
+            continue
 
-    i = idx
-    ip = idx - 1
-    price = closes[i]
+        new_sar = prev_sar + af * (ep - prev_sar)
 
-    ema3 = ema_f[i]; ema44 = ema_s[i]
-    rsi_v = r[i]
-    st_k = k_line[i]; st_d = d_line[i]
-    wt1_v = wt1[i]; wt2_v = wt2[i]
-    wt1_p = wt1[ip]; wt2_p = wt2[ip]
+        if up:
+            new_sar = min(new_sar, low[i - 1], low[i - 2])
+            if low[i] < new_sar:
+                # switch to down
+                up = False
+                sar[i] = ep
+                ep = low[i]
+                af = step
+            else:
+                sar[i] = new_sar
+                if high[i] > ep:
+                    ep = high[i]
+                    af = min(af + step, max_af)
+        else:
+            new_sar = max(new_sar, high[i - 1], high[i - 2])
+            if high[i] > new_sar:
+                # switch to up
+                up = True
+                sar[i] = ep
+                ep = high[i]
+                af = step
+            else:
+                sar[i] = new_sar
+                if low[i] < ep:
+                    ep = low[i]
+                    af = min(af + step, max_af)
 
-    if LONG_ONLY != 1:
+    return sar
+
+
+# =========================
+# Signal logic
+# =========================
+def _pick_closed_indexes(n: int) -> Tuple[int, int]:
+    """
+    Returns (prev_idx, cur_idx) for "closed candle" logic.
+    Binance klines last item often is still forming.
+    So we use -2 as "current closed", -3 as "previous closed".
+    """
+    if n < 4:
+        return -2, -1
+    return n - 3, n - 2
+
+
+def trend_color_from_series(close_series: List[float], ma_len: int) -> List[str]:
+    ma = ema(close_series, ma_len) if TREND_MA_TYPE == "EMA" else [x for x in close_series]
+    colors = []
+    for c, m in zip(close_series, ma):
+        colors.append("green" if c >= m else "red")
+    return colors
+
+
+def crosses_up(prev_a: float, prev_b: float, cur_a: float, cur_b: float) -> bool:
+    return prev_a <= prev_b and cur_a > cur_b
+
+
+def build_message(
+    symbol: str,
+    tf: str,
+    cur_close: float,
+    sar_val: Optional[float],
+    atr_val: Optional[float],
+    rsi_val: float,
+    macd_val: float,
+    macd_sig: float,
+    tp1: Optional[float],
+    tp2: Optional[float],
+    sl: Optional[float],
+) -> str:
+    now = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    lines = [
+        f"✅ LONG SİNYALİ",
+        f"🪙 {symbol}  | TF: {tf}",
+        f"⏱ {now}",
+        "",
+        f"Entry (close): {cur_close:.8f}".rstrip("0").rstrip("."),
+    ]
+    if sar_val is not None:
+        lines.append(f"SAR: {sar_val:.8f}".rstrip("0").rstrip("."))
+    if atr_val is not None:
+        lines.append(f"ATR({ATR_LEN}): {atr_val:.8f}".rstrip("0").rstrip("."))
+    lines += [
+        "",
+        f"RSI({RSI_LEN}): {rsi_val:.2f}",
+        f"MACD: {macd_val:.6f} | Signal: {macd_sig:.6f}",
+    ]
+    if sl is not None:
+        lines.append(f"🛡 SL (ATR×{ATR_SL_MULT:g}): {sl:.8f}".rstrip("0").rstrip("."))
+    if tp1 is not None:
+        lines.append(f"🎯 TP1 (ATR×{TP1_ATR_MULT:g}): {tp1:.8f}".rstrip("0").rstrip("."))
+    if tp2 is not None:
+        lines.append(f"🎯 TP2 (ATR×{TP2_ATR_MULT:g}): {tp2:.8f}".rstrip("0").rstrip("."))
+    lines += ["", "Not: Candle close onaylıdır. (Test)"]
+    return "\n".join(lines)
+
+
+def check_btc_filter() -> bool:
+    if not USE_BTC_FILTER:
+        return True
+    try:
+        kl = get_klines(BTC_SYMBOL, BTC_TF, limit=max(100, RSI_LEN + 20))
+        closes = [float(x[4]) for x in kl]
+        rs = rsi(closes, RSI_LEN)
+        prev_i, cur_i = _pick_closed_indexes(len(closes))
+        cur_rsi = rs[cur_i]
+        if cur_rsi is None:
+            return False
+        return cur_rsi >= BTC_RSI_MIN
+    except Exception:
+        return False
+
+
+def mtf_rsi_pass(symbol: str) -> bool:
+    if not USE_MTF_RSI_PREFILTER:
+        return True
+
+    checks = [
+        ("1M", MTF_RSI_1M_MAX),
+        ("1w", MTF_RSI_1W_MAX),
+        ("1d", MTF_RSI_1D_MAX),
+        ("4h", MTF_RSI_4H_MAX),
+        ("1h", MTF_RSI_1H_MAX),
+    ]
+    for interval, mx in checks:
+        try:
+            kl = get_klines(symbol, interval, limit=max(100, RSI_LEN + 20))
+            closes = [float(x[4]) for x in kl]
+            rs = rsi(closes, RSI_LEN)
+            prev_i, cur_i = _pick_closed_indexes(len(closes))
+            cur_rsi = rs[cur_i]
+            if cur_rsi is None:
+                return False
+            if cur_rsi > mx:
+                return False
+        except Exception:
+            return False
+        time.sleep(SYMBOL_SLEEP_SEC)
+    return True
+
+
+def evaluate_long_signal(symbol: str) -> Optional[Dict]:
+    kl = get_klines(symbol, TF, limit=KLINE_LIMIT)
+    if not kl or len(kl) < max(60, RSI_LEN + 10):
         return None
-    if rsi_v < RSI_MIN:
-        if DEBUG_REJECTS:
-            print(f"[REJ] {symbol} rsi {rsi_v:.2f} < {RSI_MIN}")
+
+    o = [float(x[1]) for x in kl]
+    h = [float(x[2]) for x in kl]
+    l = [float(x[3]) for x in kl]
+    c = [float(x[4]) for x in kl]
+
+    # Candle close doğrulama
+    prev_i, cur_i = _pick_closed_indexes(len(c)) if TREND_CONFIRM_CLOSE else (len(c) - 2, len(c) - 1)
+
+    # Heikin Ashi
+    if USE_HEIKIN_ASHI:
+        ha = heikin_ashi(list(zip(o, h, l, c)))
+        ha_close = [x[3] for x in ha]
+        ha_high = [x[1] for x in ha]
+        ha_low = [x[2] for x in ha]
+        trend_series_close = ha_close
+        atr_high = ha_high
+        atr_low = ha_low
+        atr_close = ha_close
+    else:
+        trend_series_close = c
+        atr_high, atr_low, atr_close = h, l, c
+
+    # Trend color change (red -> green)
+    colors = trend_color_from_series(trend_series_close, TREND_MA_LEN)
+    trend_flip = (colors[prev_i] == "red" and colors[cur_i] == "green")
+
+    # RSI cross
+    rs = rsi(c, RSI_LEN)
+    if rs[cur_i] is None or rs[prev_i] is None:
         return None
-    if not ema_ok(ema3, ema44):
-        if DEBUG_REJECTS:
-            print(f"[REJ] {symbol} ema3 {ema3:.6f} < ema44 {ema44:.6f} (tol {EMA_TOL_PCT})")
+    rsi_val_cur = float(rs[cur_i])
+    rsi_vals = [x if x is not None else 0.0 for x in rs]
+    rsi_ma = sma(rsi_vals, RSI_MA_LEN)
+
+    rsi_ok = rsi_val_cur >= RSI_MIN
+    rsi_cross_ok = True
+    if RSI_CROSS_CONFIRM:
+        if rsi_ma[cur_i] is None or rsi_ma[prev_i] is None:
+            return None
+        rsi_cross_ok = crosses_up(float(rsi_vals[prev_i]), float(rsi_ma[prev_i]), float(rsi_vals[cur_i]), float(rsi_ma[cur_i]))
+
+    # MACD cross
+    macd_line, sig_line, _ = macd(c, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
+    m_prev, m_cur = macd_line[prev_i], macd_line[cur_i]
+    s_prev, s_cur = sig_line[prev_i], sig_line[cur_i]
+    macd_cross_ok = True
+    if MACD_CROSS_CONFIRM:
+        macd_cross_ok = crosses_up(m_prev, s_prev, m_cur, s_cur)
+
+    macd_zero_ok = True
+    if MACD_ZERO_FILTER:
+        macd_zero_ok = (m_cur >= -MACD_ZERO_EPS)
+
+    # ATR / SAR
+    atr_series = atr(atr_high, atr_low, atr_close, ATR_LEN)
+    atr_val = atr_series[cur_i] if atr_series[cur_i] is not None else None
+
+    sar_val = None
+    if USE_PARABOLIC_SAR:
+        sar_series = psar(h, l, PSAR_AF_STEP, PSAR_AF_MAX)
+        sar_val = sar_series[cur_i]
+
+    # Final decision
+    all_ok = trend_flip and rsi_ok and rsi_cross_ok and macd_cross_ok and macd_zero_ok
+
+    if not all_ok:
+        if DEBUG and DEBUG_REJECTS:
+            print(json.dumps({
+                "symbol": symbol,
+                "trend_flip": trend_flip,
+                "rsi_ok": rsi_ok,
+                "rsi_cross_ok": rsi_cross_ok,
+                "macd_cross_ok": macd_cross_ok,
+                "macd_zero_ok": macd_zero_ok,
+                "rsi": rsi_val_cur,
+                "macd": m_cur,
+                "sig": s_cur,
+                "colors_prev": colors[prev_i],
+                "colors_cur": colors[cur_i],
+            }, ensure_ascii=False))
         return None
 
-    dip_ok = False
-    if USE_WT and USE_WT_DIP:
-        dip_ok = (
-            (wt1_v <= WT_OS1) and
-            cross_up(wt1_p, wt1_v, wt2_p, wt2_v) and
-            (st_k <= STOCH_OS and st_d <= STOCH_OS)
-        )
+    entry = float(c[cur_i])
+    sl = None
+    tp1 = None
+    tp2 = None
+    if atr_val is not None and atr_val > 0:
+        sl = entry - (atr_val * ATR_SL_MULT)
+        tp1 = entry + (atr_val * TP1_ATR_MULT)
+        tp2 = entry + (atr_val * TP2_ATR_MULT)
 
-    cont_ok = False
-    if USE_WT and USE_WT_CONTINUATION:
-        cont_ok = (
-            cross_up(wt1_p, wt1_v, wt2_p, wt2_v) and
-            (wt2_v <= WT_CONT_WT2_MAX) and
-            (st_k >= WT_CONT_STOCH_MIN) and
-            (rsi_v >= WT_CONT_RSI_MIN)
-        )
-
-    if not (dip_ok or cont_ok):
-        return None
-
-    sig_type = "WT_DIP" if dip_ok else "WT_CONT"
     return {
-        "type": sig_type,
         "symbol": symbol,
-        "price": price,
-        "ema_fast": ema3,
-        "ema_slow": ema44,
-        "rsi": rsi_v,
-        "stoch_k": st_k,
-        "stoch_d": st_d,
-        "wt1": wt1_v,
-        "wt2": wt2_v,
+        "tf": TF,
+        "entry": entry,
+        "sar": sar_val,
+        "atr": atr_val,
+        "rsi": rsi_val_cur,
+        "macd": m_cur,
+        "macd_sig": s_cur,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
     }
 
-def build_close_signal(symbol: str, closes: List[float], highs: List[float], lows: List[float]) -> Optional[Dict]:
-    if not (USE_WT and ENABLE_CLOSE):
-        return None
-    idx = pick_idx(len(closes))
-    hlc3 = [(highs[i] + lows[i] + closes[i]) / 3 for i in range(len(closes))]
-    wt1, wt2 = wavetrend(hlc3, WT_CH, WT_AVG)
-    i = idx
-    ip = idx - 1
-    wt1_v = wt1[i]; wt2_v = wt2[i]
-    wt1_p = wt1[ip]; wt2_p = wt2[ip]
-
-    ob_thr = WT_OB1 if CLOSE_STRICT_OB1 else WT_OB2
-    if cross_down(wt1_p, wt1_v, wt2_p, wt2_v) and (wt1_p >= ob_thr):
-        return {
-            "symbol": symbol,
-            "price": closes[i],
-            "wt1": wt1_v,
-            "wt2": wt2_v,
-            "wt1_prev": wt1_p,
-            "wt2_prev": wt2_p,
-            "ob_thr": ob_thr,
-        }
-    return None
-
-def fmt_long_message(sig: Dict) -> str:
-    title = f"🚀 <b>LONG SIGNAL</b> <code>({sig['type']})</code>"
-    s = [
-        title,
-        f"Symbol: <b>{sig['symbol']}</b>",
-        f"TF: <b>{TF_ENTRY}</b> | HTF: <b>{HTF}</b>",
-        f"Price: <b>{sig['price']:.6f}</b>" if sig["price"] < 10 else f"Price: <b>{sig['price']:.4f}</b>",
-        "",
-        f"EMA{EMA_FAST}: {sig['ema_fast']:.6f} | EMA{EMA_SLOW}: {sig['ema_slow']:.6f}",
-        f"RSI({RSI_LEN}): {sig['rsi']:.2f}",
-        f"StochRSI K/D (K={STOCH_K},D={STOCH_D}): {sig['stoch_k']:.2f}/{sig['stoch_d']:.2f}",
-        f"WT (ch={WT_CH},avg={WT_AVG}) WT1/WT2: {sig['wt1']:.2f}/{sig['wt2']:.2f}",
-        "",
-        "<b>Exit plan (manual):</b>",
-        f"- TP1: +{TP_PCT:.1f}% (suggestion)",
-        f"- SL: -{SL_PCT:.1f}% (suggestion)",
-        f"- WT exit: if WT1 crosses DOWN WT2 while WT1>{WT_OB2:.0f} consider close/trim",
-        f"- WT warning: if WT1>{WT_OB1:.0f} and turns down -> tighten stop",
-    ]
-    return "\n".join(s)
-
-def fmt_close_message(sig: Dict) -> str:
-    return "\n".join([
-        "🧯 <b>CLOSE SIGNAL</b>",
-        f"Symbol: <b>{sig['symbol']}</b>",
-        f"TF: <b>{TF_ENTRY}</b>",
-        f"Price: <b>{sig['price']:.6f}</b>" if sig["price"] < 10 else f"Price: <b>{sig['price']:.4f}</b>",
-        "",
-        f"WT1/WT2: {sig['wt1']:.2f}/{sig['wt2']:.2f}",
-        f"Reason: WT1 crossed DOWN WT2 and previous WT1 ≥ {sig['ob_thr']:.0f}",
-    ])
 
 # =========================
-# MAIN LOOP
+# Main loop
 # =========================
-def main() -> None:
-    storage = Storage(STORAGE_PATH) if USE_STORAGE else None
-    if storage:
-        storage.load()
+def main():
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("ERROR: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID eksik.")
+        return
 
-    last_heartbeat = 0.0
+    store = Storage(STORAGE_PATH)
 
-    if DEBUG:
-        print("[BOOT] Futures scanner started")
-        print(f"[CFG] TF_ENTRY={TF_ENTRY} EMA={EMA_FAST}/{EMA_SLOW} LOOKBACK={LOOKBACK} RSI_LEN={RSI_LEN} RSI_MIN={RSI_MIN} WT={USE_WT} DIP={USE_WT_DIP} CONT={USE_WT_CONTINUATION} STOCH_RSI={USE_STOCH_RSI}")
-        print(f"[CFG] TOP_N={TOP_N} MIN_QUOTE_VOLUME={MIN_QUOTE_VOLUME} COOLDOWN_SEC={COOLDOWN_SEC} DRY_RUN={DRY_RUN} USE_LAST_CANDLE={USE_LAST_CANDLE}")
-        print(f"[CFG] WATCH_REFRESH_SEC={WATCH_REFRESH_SEC} INTERVAL_SEC={INTERVAL_SEC} HEARTBEAT_SEC={HEARTBEAT_SEC}")
-        print(f"[CFG] STORAGE_PATH={STORAGE_PATH}")
-
-    # initial universe + watchlist
-    all_syms = get_usdt_perp_symbols()
-    watch = get_top_symbols_by_quote_volume(all_syms, TOP_N)
-    last_watch_refresh = time.time()
-
-    if DEBUG:
-        print(f"[INFO] symbols in universe: {len(all_syms)} | watching: {len(watch)}")
+    print("✅ futures-scanner started")
+    print(f"TF={TF} interval_sec={INTERVAL_SEC} HA={USE_HEIKIN_ASHI} trend=EMA({TREND_MA_LEN})")
+    print(f"MTF prefilter={USE_MTF_RSI_PREFILTER} | BTC filter={USE_BTC_FILTER} | 24h vol filter={USE_24H_VOLUME_FILTER}")
 
     while True:
-        now = time.time()
-
-        # heartbeat
-        if (now - last_heartbeat) >= HEARTBEAT_SEC:
-            send_telegram(f"✅ worker alive | TF={TF_ENTRY} TOP_N={TOP_N} DIP={USE_WT_DIP} CONT={USE_WT_CONTINUATION}")
-            last_heartbeat = now
-
-        # NEW: refresh watchlist periodically (does NOT change strategy, only updates universe)
-        if WATCH_REFRESH_SEC > 0 and (now - last_watch_refresh) >= WATCH_REFRESH_SEC:
-            try:
-                all_syms = get_usdt_perp_symbols()
-                watch = get_top_symbols_by_quote_volume(all_syms, TOP_N)
-                last_watch_refresh = now
+        try:
+            if USE_BTC_FILTER and not check_btc_filter():
                 if DEBUG:
-                    print(f"[INFO] watchlist refreshed | universe={len(all_syms)} watching={len(watch)} TOP_N={TOP_N}")
-                send_telegram(f"🔄 watchlist refreshed | TOP_N={TOP_N} watching={len(watch)} TF={TF_ENTRY}")
-            except Exception as e:
-                if DEBUG:
-                    print("[ERR] watchlist refresh failed:", repr(e))
-
-        # scan
-        for sym in watch:
-            try:
-                kl = get_klines(sym, TF_ENTRY, KLINE_LIMIT)
-                if not kl or len(kl) < 50:
-                    continue
-                o, h, l, c, v = klines_to_ohlc(kl)
-
-                sig = build_long_signal(sym, c, h, l)
-                if sig:
-                    if storage and storage.is_cooldown(sym, "entry", COOLDOWN_SEC):
-                        continue
-                    send_telegram(fmt_long_message(sig))
-                    if storage:
-                        storage.touch(sym, "entry")
-                        storage.save()
-
-                cs = build_close_signal(sym, c, h, l)
-                if cs:
-                    if storage and storage.is_cooldown(sym, "close", CLOSE_COOLDOWN_SEC):
-                        continue
-                    send_telegram(fmt_close_message(cs))
-                    if storage:
-                        storage.touch(sym, "close")
-                        storage.save()
-
-            except Exception as e:
-                if DEBUG:
-                    print(f"[ERR] {sym} -> {repr(e)}")
+                    print("BTC filter: PASS değil (RSI düşük). Bu cycle skip.")
+                time.sleep(INTERVAL_SEC)
                 continue
 
-        if TEST_ONCE:
-            break
+            symbols = get_exchange_symbols_usdt_perp() if SCAN_ALL_USDT_PERPS else []
+            if not symbols:
+                print("ERROR: Symbol list boş.")
+                time.sleep(INTERVAL_SEC)
+                continue
+
+            vols = get_24h_quote_volumes() if USE_24H_VOLUME_FILTER else {}
+
+            sent_count = 0
+            scanned = 0
+
+            for sym in symbols:
+                scanned += 1
+                if MAX_SYMBOLS_PER_CYCLE and scanned > MAX_SYMBOLS_PER_CYCLE:
+                    break
+
+                # 24h volume filter
+                if USE_24H_VOLUME_FILTER:
+                    qv = vols.get(sym, 0.0)
+                    if qv < MIN_QUOTE_VOLUME_24H:
+                        if DEBUG and DEBUG_REJECTS:
+                            print(f"{sym} reject: low 24h quoteVolume {qv:.0f}")
+                        continue
+
+                # cooldown
+                if COOLDOWN_SEC > 0 and store.is_in_cooldown(sym, "LONG", COOLDOWN_SEC):
+                    continue
+
+                # MTF RSI prefilter
+                if USE_MTF_RSI_PREFILTER:
+                    ok = mtf_rsi_pass(sym)
+                    if not ok:
+                        if DEBUG and DEBUG_REJECTS:
+                            print(f"{sym} reject: MTF RSI prefilter fail")
+                        continue
+
+                # Entry conditions on TF
+                sig = evaluate_long_signal(sym)
+                if sig is None:
+                    time.sleep(SYMBOL_SLEEP_SEC)
+                    continue
+
+                msg = build_message(
+                    symbol=sig["symbol"],
+                    tf=sig["tf"],
+                    cur_close=sig["entry"],
+                    sar_val=sig["sar"],
+                    atr_val=sig["atr"],
+                    rsi_val=sig["rsi"],
+                    macd_val=sig["macd"],
+                    macd_sig=sig["macd_sig"],
+                    tp1=sig["tp1"],
+                    tp2=sig["tp2"],
+                    sl=sig["sl"],
+                )
+
+                if DRY_RUN:
+                    print("DRY_RUN signal:\n", msg)
+                else:
+                    send_telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, msg)
+
+                store.mark_sent(sym, "LONG")
+                sent_count += 1
+
+                # “her bulduğu noktada kaç tane bulursa göndersin”
+                # yani limit yok, buldukça bas.
+
+                time.sleep(SYMBOL_SLEEP_SEC)
+
+            if DEBUG:
+                print(f"Cycle done. scanned={scanned} sent={sent_count}")
+
+        except Exception as e:
+            print("Loop error:", repr(e))
+
         time.sleep(INTERVAL_SEC)
+
 
 if __name__ == "__main__":
     main()
