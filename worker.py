@@ -39,7 +39,7 @@ def format_items(payload, top_n: int = TOP_N) -> str:
         r1d = it.get("rsi_1d")
         r4h = it.get("rsi_4h")
         r1h = it.get("rsi_1h")
-        reasons = ",".join(it.get("reasons", []))[:140]
+        reasons = ",".join(it.get("reasons", []))[:180]
         lines.append(f"{sym} | 1M:{r1m} 1W:{r1w} 1D:{r1d} 4H:{r4h} 1H:{r1h} | {reasons}")
 
     if len(items) > top_n:
@@ -107,10 +107,12 @@ def main():
 
                 cmd = text.strip()
 
+                # Sistemden bağımsız: son kaydı göster
                 if cmd == "/diplist":
                     payload = load_diplist(STORAGE_PATH)
                     send_message(format_items(payload))
 
+                # Sistemden bağımsız: anında üret
                 elif cmd.startswith("/diplist"):
                     parts = cmd.split()
                     if len(parts) >= 2 and parts[1].lower() == "now":
@@ -119,10 +121,9 @@ def main():
                         send_message("Kullanım: /diplist  veya  /diplist now")
 
         except requests.exceptions.ReadTimeout:
-            # Telegram long-polling için bu normal olabilir. Hata diye spamlamıyoruz.
+            # long polling: normal
             continue
         except Exception as e:
-            # gerçek hatalar
             send_message(f"⚠️ Worker hata: {type(e).__name__}")
             time.sleep(2)
 
