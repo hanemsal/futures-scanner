@@ -1,123 +1,242 @@
 import os
 import time
+import json
 import threading
-from datetime import datetime
-from zoneinfo import ZoneInfo
-
-from apscheduler.schedulers.background import BackgroundScheduler
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from diplist import build_diplist, save_diplist, load_diplist, render_text
 from telegram_bot import send_message, get_updates
 
-TZ = ZoneInfo("Europe/Istanbul")
-
 STORAGE_PATH = os.getenv("STORAGE_PATH", "/tmp/diplist.json")
-TOP_N = int(os.getenv("DIPLIST_TOP_N", "40"))
+PORT = int(os.getenv("PORT", "10000"))
 
-# aynı anda 2 scan başlamasın diye lock
-_scan_lock = threading.Lock()
-_last_scan_started = 0.0
+HTML_PATH = "/tmp/diplist.html"
 
-
-def public_base_url() -> str:
-    # Render domain üretimi (site yok derdin burada çözülüyor)
-    svc = os.getenv("RENDER_SERVICE_NAME", "").strip()
-    if svc:
-        return f"https://{svc}.onrender.com"
-    host = os.getenv("RENDER_EXTERNAL_HOSTNAME", "").strip()
-    if host:
-        if host.startswith("http"):
-            return host
-        return f"https://{host}"
-    return ""
+SCAN_LOCK = False
 
 
-def run_diplist(manual: bool) -> None:
-    global _last_scan_started
+# =========================
+# HTML OLUŞTUR
+# =========================
 
-    # 1) aynı anda ikinci scan’i engelle
-    if not _scan_lock.acquire(blocking=False):
-        send_message("⏳ DipList zaten çalışıyor. Lütfen bitmesini bekle.")
+def generate_html(data):
+
+    rows = []
+
+    for x in data["results"]:
+
+        rows.append(f"""
+<tr>
+<td>{x['symbol']}</td>
+<td>{x['rsi_1m']}</td>
+<td>{x['rsi_1w']}</td>
+<td>{x['rsi_1d']}</td>
+<td>{x['rsi_4h']}</td>
+<td>{x['rsi_1h']}</td>
+<td>{",".join(x['triggers'])}</td>
+</tr>
+""")
+
+    html = f"""
+<html>
+<head>
+<meta charset="utf-8">
+<title>DipList</title>
+
+<style>
+
+body {{
+background:#111;
+color:#eee;
+font-family:Arial;
+padding:20px
+}}
+
+table {{
+border-collapse: collapse;
+width:100%
+}}
+
+td,th {{
+border:1px solid #333;
+padding:6px
+}}
+
+th {{
+background:#222
+}}
+
+</style>
+
+</head>
+
+<body>
+
+<h2>DipList</h2>
+
+<p>Total Coins: {len(data["results"])}</p>
+
+<table>
+
+<tr>
+<th>Symbol</th>
+<th>1M</th>
+<th>1W</th>
+<th>1D</th>
+<th>4H</th>
+<th>1H</th>
+<th>Trigger</th>
+</tr>
+
+{''.join(rows)}
+
+</table>
+
+</body>
+</html>
+"""
+
+    with open(HTML_PATH, "w", encoding="utf-8") as f:
+        f.write(html)
+
+
+# =========================
+# WEB SERVER
+# =========================
+
+class Handler(BaseHTTPRequestHandler):
+
+    def do_GET(self):
+
+        if self.path == "/diplist":
+
+            if not os.path.exists(HTML_PATH):
+
+                self.send_response(404)
+                self.end_headers()
+                self.wfile.write(b"Diplist not generated yet")
+                return
+
+            self.send_response(200)
+            self.send_header("Content-type", "text/html")
+            self.end_headers()
+
+            with open(HTML_PATH, "rb") as f:
+                self.wfile.write(f.read())
+
+        else:
+
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"Scanner Running")
+
+
+def start_web():
+
+    server = HTTPServer(("0.0.0.0", PORT), Handler)
+    server.serve_forever()
+
+
+# =========================
+# DIPLIST
+# =========================
+
+def run_diplist(manual=False):
+
+    global SCAN_LOCK
+
+    if SCAN_LOCK:
+        send_message("⏳ DipList zaten çalışıyor...")
         return
 
+    SCAN_LOCK = True
+
     try:
-        _last_scan_started = time.time()
-        send_message(f"⏳ DipList başlıyor ({'MANUEL' if manual else 'SCHEDULE'})...")
+
+        send_message("⏳ DipList başlıyor...")
 
         results, meta = build_diplist()
+
         save_diplist(STORAGE_PATH, results, meta)
 
-        msg = render_text(results, meta, top_n=TOP_N)
+        data = load_diplist(STORAGE_PATH)
 
-        base = public_base_url()
-        if base:
-            msg += f"\n\nİncele:\n{base}/diplist"
-        else:
-            msg += "\n\nİncele:\n/diplist (Render domain yoksa sadece bot çıktısı kullan)"
+        generate_html(data)
+
+        service = os.getenv("RENDER_SERVICE_NAME")
+
+        url = f"https://{service}.onrender.com/diplist"
+
+        msg = render_text(results, meta, top_n=40)
+
+        msg += f"\n\nTüm liste:\n{url}"
 
         send_message(msg)
 
     except Exception as e:
-        send_message(f"⚠️ Worker hata: {type(e).__name__}: {e}")
+
+        send_message(f"HATA: {e}")
+
     finally:
-        _scan_lock.release()
+
+        SCAN_LOCK = False
 
 
-def diplist_now():
-    run_diplist(manual=True)
-
-
-def setup_scheduler():
-    sched = BackgroundScheduler(timezone=TZ)
-
-    # 02:00 / 14:00 / 20:00 TR
-    sched.add_job(lambda: run_diplist(manual=False), "cron", hour=2, minute=0, id="dip_02")
-    sched.add_job(lambda: run_diplist(manual=False), "cron", hour=14, minute=0, id="dip_14")
-    sched.add_job(lambda: run_diplist(manual=False), "cron", hour=20, minute=0, id="dip_20")
-
-    sched.start()
-    send_message("⏰ Schedule aktif (Europe/Istanbul) -> 02:00,14:00,20:00")
-
+# =========================
+# TELEGRAM LOOP
+# =========================
 
 def telegram_loop():
+
     offset = None
-    send_message("🤖 Worker başladı. Komutlar: /diplist | /diplist now")
+
+    send_message("🤖 Scanner başladı\nKomutlar: /diplist now")
 
     while True:
+
         try:
-            data = get_updates(offset=offset, timeout_sec=30)
-            if not data.get("ok"):
-                time.sleep(2)
-                continue
 
-            for upd in data.get("result", []):
-                offset = upd["update_id"] + 1
-                msg = (upd.get("message") or {}).get("text") or ""
-                msg = msg.strip()
+            data = get_updates(offset)
 
-                if msg == "/diplist":
-                    payload = load_diplist(STORAGE_PATH)
-                    if not payload:
-                        send_message("DipList bulunamadı. Önce /diplist now ile üret.")
+            for u in data.get("result", []):
+
+                offset = u["update_id"] + 1
+
+                text = u["message"].get("text", "")
+
+                if text == "/diplist now":
+
+                    run_diplist(True)
+
+                elif text == "/diplist":
+
+                    data = load_diplist(STORAGE_PATH)
+
+                    if not data:
+                        send_message("Diplist yok.")
                         continue
-                    results = payload.get("results", [])
-                    meta = payload.get("meta", {})
-                    out = render_text(results, meta, top_n=TOP_N)
-                    base = public_base_url()
-                    if base:
-                        out += f"\n\nİncele:\n{base}/diplist"
-                    send_message(out)
 
-                elif msg in ["/diplist now", "/diplist_now"]:
-                    diplist_now()
+                    service = os.getenv("RENDER_SERVICE_NAME")
+
+                    url = f"https://{service}.onrender.com/diplist"
+
+                    send_message(f"Son diplist:\n{url}")
 
         except Exception as e:
-            send_message(f"⚠️ Worker hata: {type(e).__name__}: {e}")
-            time.sleep(3)
 
+            print(e)
+
+        time.sleep(2)
+
+
+# =========================
+# MAIN
+# =========================
 
 def main():
-    setup_scheduler()
+
+    threading.Thread(target=start_web, daemon=True).start()
+
     telegram_loop()
 
 
