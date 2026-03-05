@@ -14,6 +14,9 @@ PORT = int(os.getenv("PORT", "10000"))
 SCHEDULE_HOURS = [2, 14, 20]
 
 
+# =========================
+# HTML RAPOR
+# =========================
 def generate_html(data):
 
     rows = []
@@ -37,12 +40,31 @@ def generate_html(data):
 <head>
 <meta charset="utf-8">
 <title>DipList</title>
+
 <style>
-body {{ font-family: Arial; background:#111; color:#eee }}
-table {{ border-collapse: collapse; width:100% }}
-td,th {{ border:1px solid #333; padding:6px }}
-th {{ background:#222 }}
+
+body {{
+background:#111;
+color:#eee;
+font-family:Arial
+}}
+
+table {{
+border-collapse: collapse;
+width:100%
+}}
+
+td,th {{
+border:1px solid #333;
+padding:6px
+}}
+
+th {{
+background:#222
+}}
+
 </style>
+
 </head>
 
 <body>
@@ -75,6 +97,9 @@ th {{ background:#222 }}
         f.write(html)
 
 
+# =========================
+# WEB SERVER
+# =========================
 class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
@@ -108,6 +133,9 @@ def run_web():
     server.serve_forever()
 
 
+# =========================
+# DIPLIST CALCULATE
+# =========================
 def run_diplist(manual=False):
 
     if manual:
@@ -124,7 +152,7 @@ def run_diplist(manual=False):
     url = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}/diplist"
 
     send_message(
-        f"""✅ DipList hazır
+f"""✅ DipList hazır
 
 Scanned: {meta['symbols_scanned']}
 Dip: {meta['dip_count']}
@@ -136,6 +164,9 @@ Time: {meta['elapsed_sec']}s
     )
 
 
+# =========================
+# SCHEDULER
+# =========================
 def scheduler_loop():
 
     last_run = None
@@ -157,6 +188,9 @@ def scheduler_loop():
         time.sleep(30)
 
 
+# =========================
+# TELEGRAM
+# =========================
 def telegram_loop():
 
     offset = None
@@ -188,8 +222,7 @@ def telegram_loop():
                     url = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}/diplist"
 
                     send_message(
-                        f"""
-Son DipList
+f"""Son DipList
 
 Toplam Coin: {len(data["items"])}
 
@@ -205,6 +238,9 @@ Toplam Coin: {len(data["items"])}
         time.sleep(2)
 
 
+# =========================
+# MAIN
+# =========================
 def main():
 
     send_message("🤖 Worker başladı. Komutlar: /diplist | /diplist now")
