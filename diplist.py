@@ -11,15 +11,20 @@ BINANCE_FAPI = os.getenv("BINANCE_FAPI", "https://fapi.binance.com").rstrip("/")
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "60"))
 KLINE_LIMIT = int(os.getenv("KLINE_LIMIT", "200"))
 
-# Model-1 eşikleri
+# Model-1 eşikleri (senin sayılar)
 RSI_1M_MAX = float(os.getenv("RSI_1M_MAX", "10"))
 RSI_1W_MAX = float(os.getenv("RSI_1W_MAX", "20"))
 RSI_1D_MAX = float(os.getenv("RSI_1D_MAX", "30"))
 RSI_4H_MAX = float(os.getenv("RSI_4H_MAX", "30"))
 RSI_1H_MAX = float(os.getenv("RSI_1H_MAX", "30"))
 
-# Testte düşük tut: 50, sonra 0 yapıp tüm evren
-MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "50"))
+# 0 => tüm coinler
+MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "0"))
+
+# DIPLIST_MODE:
+# - "UNION": herhangi bir timeframe koşulu tutarsa listeye girer (senin "hepsi listelenecek" isteğin)
+# - "ALL": hepsi aynı anda tutarsa listeye girer (eski davranış)
+DIPLIST_MODE = os.getenv("DIPLIST_MODE", "UNION").strip().upper()
 
 
 @dataclass
@@ -31,25 +36,23 @@ class DipItem:
     rsi_1d: Optional[float]
     rsi_4h: Optional[float]
     rsi_1h: Optional[float]
-    reasons: List[str]
+    triggers: List[str]   # hangi timeframe tetikledi (örn: ["1H", "4H"])
+    reasons: List[str]    # metin açıklama
 
 
 def _http_get(url: str, params: Dict[str, Any]) -> Any:
-    """
-    Binance geçici yavaşlama / 429 / timeout için retry + backoff.
-    """
     last_err = None
-    for attempt in range(6):
+    for attempt in range(7):
         try:
             r = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
             if r.status_code in (418, 429):
-                time.sleep(1.0 + attempt * 1.5)
+                time.sleep(1.0 + attempt * 1.7)
                 continue
             r.raise_for_status()
             return r.json()
         except Exception as e:
             last_err = e
-            time.sleep(0.8 + attempt * 1.2)
+            time.sleep(0.9 + attempt * 1.4)
     raise last_err
 
 
@@ -69,8 +72,11 @@ def get_usdt_perp_symbols() -> List[str]:
             out.append(sym)
 
     out.sort()
+
+    # MAX_SYMBOLS=0 => sınırlama yok
     if MAX_SYMBOLS and len(out) > MAX_SYMBOLS:
         out = out[:MAX_SYMBOLS]
+
     return out
 
 
@@ -130,13 +136,16 @@ def build_diplist() -> Tuple[List[DipItem], Dict[str, Any]]:
     items: List[DipItem] = []
     errors = 0
 
-    # PASS DEBUG sayaçları
+    # PASS debug sayaçları (koşulları tek tek geçen kaç coin var)
     c_1m = 0
     c_1w = 0
     c_1d = 0
     c_4h = 0
     c_1h = 0
     c_all = 0
+
+    # UNION sayacı (en az 1 tetikleyen)
+    c_union = 0
 
     for sym in symbols:
         tv = f"{sym}.P"
@@ -153,7 +162,13 @@ def build_diplist() -> Tuple[List[DipItem], Dict[str, Any]]:
             errors += 1
             continue
 
-        # MODEL-1 (senin tarifin): AND kuralı
+        # Senin tarifin:
+        # 1M: 0-10 + değer almayan
+        # 1W: 0-20 + değer almayan
+        # 1D: 0-30
+        # 4H: 0-30
+        # 1H: 0-30
+
         cond_1m = (rsi_1m is None) or (rsi_1m <= RSI_1M_MAX)
         cond_1w = (rsi_1w is None) or (rsi_1w <= RSI_1W_MAX)
         cond_1d = (rsi_1d is not None) and (rsi_1d <= RSI_1D_MAX)
@@ -173,24 +188,36 @@ def build_diplist() -> Tuple[List[DipItem], Dict[str, Any]]:
             c_1h += 1
         if cond_1m and cond_1w and cond_1d and cond_4h and cond_1h:
             c_all += 1
-        else:
-            continue
 
-        # reasons: hangi şartlar tuttu
+        triggers: List[str] = []
         reasons: List[str] = []
-        if rsi_1m is None:
-            reasons.append("1M=NaN")
-        else:
-            reasons.append(f"1M<= {RSI_1M_MAX} ({rsi_1m})")
 
-        if rsi_1w is None:
-            reasons.append("1W=NaN")
-        else:
-            reasons.append(f"1W<= {RSI_1W_MAX} ({rsi_1w})")
+        # UNION mantığı: herhangi biri tetiklerse listede göster
+        if cond_1m:
+            triggers.append("1M")
+            reasons.append("1M=NaN" if rsi_1m is None else f"1M<= {RSI_1M_MAX} ({rsi_1m})")
+        if cond_1w:
+            triggers.append("1W")
+            reasons.append("1W=NaN" if rsi_1w is None else f"1W<= {RSI_1W_MAX} ({rsi_1w})")
+        if cond_1d:
+            triggers.append("1D")
+            reasons.append(f"1D<= {RSI_1D_MAX} ({rsi_1d})")
+        if cond_4h:
+            triggers.append("4H")
+            reasons.append(f"4H<= {RSI_4H_MAX} ({rsi_4h})")
+        if cond_1h:
+            triggers.append("1H")
+            reasons.append(f"1H<= {RSI_1H_MAX} ({rsi_1h})")
 
-        reasons.append(f"1D<= {RSI_1D_MAX} ({rsi_1d})")
-        reasons.append(f"4H<= {RSI_4H_MAX} ({rsi_4h})")
-        reasons.append(f"1H<= {RSI_1H_MAX} ({rsi_1h})")
+        if DIPLIST_MODE == "ALL":
+            # eski davranış: hepsi aynı anda
+            if not (cond_1m and cond_1w and cond_1d and cond_4h and cond_1h):
+                continue
+        else:
+            # yeni davranış: UNION (senin "hepsi listelenecek")
+            if not triggers:
+                continue
+            c_union += 1
 
         items.append(
             DipItem(
@@ -201,29 +228,35 @@ def build_diplist() -> Tuple[List[DipItem], Dict[str, Any]]:
                 rsi_1d=rsi_1d,
                 rsi_4h=rsi_4h,
                 rsi_1h=rsi_1h,
+                triggers=triggers,
                 reasons=reasons,
             )
         )
 
     elapsed = round(time.time() - t0, 2)
     meta = {
+        "mode": DIPLIST_MODE,
         "symbols_scanned": len(symbols),
         "dip_count": len(items),
         "errors": errors,
         "elapsed_sec": elapsed,
-        # PASS DEBUG meta
+        # PASS DEBUG
         "pass_1m": c_1m,
         "pass_1w": c_1w,
         "pass_1d": c_1d,
         "pass_4h": c_4h,
         "pass_1h": c_1h,
         "pass_all": c_all,
+        "pass_union": c_union,
     }
     return items, meta
 
 
 def save_diplist(path: str, items: List[DipItem], meta: Dict[str, Any]) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # /tmp gibi dizinlerde dirname("") problem olmasın
+    dirn = os.path.dirname(path) or "."
+    os.makedirs(dirn, exist_ok=True)
+
     payload = {
         "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
         "items": [asdict(x) for x in items],
