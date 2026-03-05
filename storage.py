@@ -2,13 +2,13 @@
 import json
 import os
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 
 class Storage:
     """
     Basit JSON storage (atomic write).
-    Render disk mount: /var/data kullanacaksın.
+    Render disk mount: /var/data
     """
     def __init__(self, path: str):
         self.path = path
@@ -26,10 +26,11 @@ class Storage:
             else:
                 self._cache = {}
         except Exception:
-            # bozuk dosya vs. olursa sıfırdan başlar
             self._cache = {}
 
-    def get(self, key: str, default: Any = None) -> Any:
+    # NOT: Eski kodlarda yanlışlıkla 3 argümanla çağrılmış olabilir.
+    # Bu yüzden *args kabul edip kırılmayı engelliyoruz.
+    def get(self, key: str, default: Any = None, *args, **kwargs) -> Any:
         self._ensure_loaded()
         return self._cache.get(key, default)
 
@@ -39,9 +40,8 @@ class Storage:
         self._flush()
 
     def _flush(self) -> None:
-        # Atomic write: önce tmp yaz, sonra rename
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        tmp_path = f"{self.path}.tmp.{int(time.time()*1000)}"
+        tmp_path = f"{self.path}.tmp.{int(time.time() * 1000)}"
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(self._cache, f, ensure_ascii=False, indent=2)
         os.replace(tmp_path, self.path)
