@@ -11,13 +11,15 @@ BINANCE_FAPI = os.getenv("BINANCE_FAPI", "https://fapi.binance.com").rstrip("/")
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "60"))
 KLINE_LIMIT = int(os.getenv("KLINE_LIMIT", "200"))
 
+# Model-1 eşikleri
 RSI_1M_MAX = float(os.getenv("RSI_1M_MAX", "10"))
 RSI_1W_MAX = float(os.getenv("RSI_1W_MAX", "20"))
 RSI_1D_MAX = float(os.getenv("RSI_1D_MAX", "30"))
 RSI_4H_MAX = float(os.getenv("RSI_4H_MAX", "30"))
 RSI_1H_MAX = float(os.getenv("RSI_1H_MAX", "30"))
 
-MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "50"))  # ilk testte 50, sonra 0 yaparsın
+# Testte düşük tut: 50, sonra 0 yapıp tüm evren
+MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "50"))
 
 
 @dataclass
@@ -34,7 +36,7 @@ class DipItem:
 
 def _http_get(url: str, params: Dict[str, Any]) -> Any:
     """
-    Binance bazen yavaşlar / 429 verir. Retry + backoff.
+    Binance geçici yavaşlama / 429 / timeout için retry + backoff.
     """
     last_err = None
     for attempt in range(6):
@@ -130,52 +132,57 @@ def build_diplist() -> Tuple[List[DipItem], Dict[str, Any]]:
 
     for sym in symbols:
         tv = f"{sym}.P"
-        reasons: List[str] = []
 
         rsi_1h = rsi_4h = rsi_1d = rsi_1w = rsi_1m = None
 
         try:
             rsi_1h = compute_rsi(sym, "1h")
-            if rsi_1h is not None and rsi_1h <= RSI_1H_MAX:
-                reasons.append(f"1H<= {RSI_1H_MAX} ({rsi_1h})")
-
             rsi_4h = compute_rsi(sym, "4h")
-            if rsi_4h is not None and rsi_4h <= RSI_4H_MAX:
-                reasons.append(f"4H<= {RSI_4H_MAX} ({rsi_4h})")
-
             rsi_1d = compute_rsi(sym, "1d")
-            if rsi_1d is not None and rsi_1d <= RSI_1D_MAX:
-                reasons.append(f"1D<= {RSI_1D_MAX} ({rsi_1d})")
-
-            # 1W / 1M: hem eşik hem "değer almamış" (None)
             rsi_1w = compute_rsi(sym, "1w")
-            if rsi_1w is None:
-                reasons.append("1W=NaN")
-            elif rsi_1w <= RSI_1W_MAX:
-                reasons.append(f"1W<= {RSI_1W_MAX} ({rsi_1w})")
-
             rsi_1m = compute_rsi(sym, "1M")
-            if rsi_1m is None:
-                reasons.append("1M=NaN")
-            elif rsi_1m <= RSI_1M_MAX:
-                reasons.append(f"1M<= {RSI_1M_MAX} ({rsi_1m})")
-
         except Exception:
             errors += 1
+            continue
 
-        if reasons:
-            items.append(
-                DipItem(
-                    symbol=sym,
-                    tv_symbol=tv,
-                    rsi_1m=rsi_1m,
-                    rsi_1w=rsi_1w,
-                    rsi_1d=rsi_1d,
-                    rsi_4h=rsi_4h,
-                    rsi_1h=rsi_1h,
-                    reasons=reasons,
-                )
+        # MODEL-1 (senin tarifin): AND kuralı
+        cond_1m = (rsi_1m is None) or (rsi_1m <= RSI_1M_MAX)
+        cond_1w = (rsi_1w is None) or (rsi_1w <= RSI_1W_MAX)
+        cond_1d = (rsi_1d is not None) and (rsi_1d <= RSI_1D_MAX)
+        cond_4h = (rsi_4h is not None) and (rsi_4h <= RSI_4H_MAX)
+        cond_1h = (rsi_1h is not None) and (rsi_1h <= RSI_1H_MAX)
+
+        if not (cond_1m and cond_1w and cond_1d and cond_4h and cond_1h):
+            continue
+
+        # reasons: hangi şartlar tuttu
+        reasons: List[str] = []
+        if rsi_1m is None:
+            reasons.append("1M=NaN")
+        else:
+            reasons.append(f"1M<= {RSI_1M_MAX} ({rsi_1m})")
+
+        if rsi_1w is None:
+            reasons.append("1W=NaN")
+        else:
+            reasons.append(f"1W<= {RSI_1W_MAX} ({rsi_1w})")
+
+        reasons.append(f"1D<= {RSI_1D_MAX} ({rsi_1d})")
+        reasons.append(f"4H<= {RSI_4H_MAX} ({rsi_4h})")
+        reasons.append(f"1H<= {RSI_1H_MAX} ({rsi_1h})")
+
+        items.append(
+            DipItem(
+                symbol=sym,
+                tv_symbol=tv,
+                rsi_1m=rsi_1m,
+                rsi_1w=rsi_1w,
+                rsi_1d=rsi_1d,
+                rsi_4h=rsi_4h,
+                rsi_1h=rsi_1h,
+                reasons=reasons,
             )
+        )
 
     elapsed = round(time.time() - t0, 2)
     meta = {
