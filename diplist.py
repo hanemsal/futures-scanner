@@ -8,24 +8,22 @@ from typing import List, Optional, Dict, Any, Tuple
 import requests
 
 BINANCE_FAPI = os.getenv("BINANCE_FAPI", "https://fapi.binance.com").rstrip("/")
-HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "10"))
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "60"))
 KLINE_LIMIT = int(os.getenv("KLINE_LIMIT", "200"))
 
-# RSI eşikleri
 RSI_1M_MAX = float(os.getenv("RSI_1M_MAX", "10"))
 RSI_1W_MAX = float(os.getenv("RSI_1W_MAX", "20"))
 RSI_1D_MAX = float(os.getenv("RSI_1D_MAX", "30"))
 RSI_4H_MAX = float(os.getenv("RSI_4H_MAX", "30"))
 RSI_1H_MAX = float(os.getenv("RSI_1H_MAX", "30"))
 
-# Performans için ilk testte sınır koyabilirsin
-MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "0"))  # 0 = sınırsız
+MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "50"))  # ilk testte 50, sonra 0 yaparsın
 
 
 @dataclass
 class DipItem:
-    symbol: str          # Binance symbol, örn BTCUSDT
-    tv_symbol: str       # TradingView display, örn BTCUSDT.P
+    symbol: str
+    tv_symbol: str
     rsi_1m: Optional[float]
     rsi_1w: Optional[float]
     rsi_1d: Optional[float]
@@ -35,18 +33,28 @@ class DipItem:
 
 
 def _http_get(url: str, params: Dict[str, Any]) -> Any:
-    r = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    return r.json()
+    """
+    Binance bazen yavaşlar / 429 verir. Retry + backoff.
+    """
+    last_err = None
+    for attempt in range(6):
+        try:
+            r = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
+            if r.status_code in (418, 429):
+                time.sleep(1.0 + attempt * 1.5)
+                continue
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_err = e
+            time.sleep(0.8 + attempt * 1.2)
+    raise last_err
 
 
 def get_usdt_perp_symbols() -> List[str]:
-    """
-    Binance Futures USDT perpetual, TRADING olan tüm semboller.
-    """
     url = f"{BINANCE_FAPI}/fapi/v1/exchangeInfo"
     data = _http_get(url, {})
-    out = []
+    out: List[str] = []
     for s in data.get("symbols", []):
         if s.get("status") != "TRADING":
             continue
@@ -57,6 +65,7 @@ def get_usdt_perp_symbols() -> List[str]:
         sym = s.get("symbol")
         if sym:
             out.append(sym)
+
     out.sort()
     if MAX_SYMBOLS and len(out) > MAX_SYMBOLS:
         out = out[:MAX_SYMBOLS]
@@ -67,9 +76,8 @@ def get_closes(symbol: str, interval: str, limit: int = KLINE_LIMIT) -> List[flo
     url = f"{BINANCE_FAPI}/fapi/v1/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
     klines = _http_get(url, params)
-    closes = []
+    closes: List[float] = []
     for k in klines:
-        # k[4] close
         try:
             closes.append(float(k[4]))
         except Exception:
@@ -78,10 +86,6 @@ def get_closes(symbol: str, interval: str, limit: int = KLINE_LIMIT) -> List[flo
 
 
 def rsi_wilder(closes: List[float], period: int = 14) -> Optional[float]:
-    """
-    RSI(14) Wilder smoothing.
-    Yeterli mum yoksa None döner (değer almamış).
-    """
     if closes is None or len(closes) < period + 1:
         return None
 
@@ -95,7 +99,6 @@ def rsi_wilder(closes: List[float], period: int = 14) -> Optional[float]:
     avg_gain = sum(gains) / period
     avg_loss = sum(losses) / period
 
-    # Wilder smoothing
     for i in range(period + 1, len(closes)):
         delta = closes[i] - closes[i - 1]
         gain = max(delta, 0.0)
@@ -105,6 +108,7 @@ def rsi_wilder(closes: List[float], period: int = 14) -> Optional[float]:
 
     if avg_loss == 0:
         return 100.0
+
     rs = avg_gain / avg_loss
     rsi = 100.0 - (100.0 / (1.0 + rs))
     if math.isnan(rsi) or math.isinf(rsi):
@@ -117,31 +121,14 @@ def compute_rsi(symbol: str, interval: str) -> Optional[float]:
     return rsi_wilder(closes, period=14)
 
 
-def qualifies(item: DipItem) -> bool:
-    """
-    Union: herhangi bir koşul tutarsa listede.
-    1M: 0-10 veya None
-    1W: 0-20 veya None
-    1D: 0-30
-    4H: 0-30
-    1H: 0-30
-    """
-    # reasons zaten dolduruluyor; burada sadece hızlı true/false
-    return len(item.reasons) > 0
-
-
 def build_diplist() -> Tuple[List[DipItem], Dict[str, Any]]:
-    """
-    Dip list üretir. Performans için:
-    Önce 1H/4H/1D bakar, tutmazsa 1W/1M'e geçer.
-    """
     symbols = get_usdt_perp_symbols()
     t0 = time.time()
 
     items: List[DipItem] = []
     errors = 0
 
-    for idx, sym in enumerate(symbols, start=1):
+    for sym in symbols:
         tv = f"{sym}.P"
         reasons: List[str] = []
 
@@ -160,8 +147,7 @@ def build_diplist() -> Tuple[List[DipItem], Dict[str, Any]]:
             if rsi_1d is not None and rsi_1d <= RSI_1D_MAX:
                 reasons.append(f"1D<= {RSI_1D_MAX} ({rsi_1d})")
 
-            # 1W / 1M sadece lazım olduğunda (ya zaten dipte, ya da NaN avı)
-            # Ama 1W/1M NaN olanları da yakalamak istediğin için, burada yine kontrol ediyoruz:
+            # 1W / 1M: hem eşik hem "değer almamış" (None)
             rsi_1w = compute_rsi(sym, "1w")
             if rsi_1w is None:
                 reasons.append("1W=NaN")
@@ -177,19 +163,19 @@ def build_diplist() -> Tuple[List[DipItem], Dict[str, Any]]:
         except Exception:
             errors += 1
 
-        item = DipItem(
-            symbol=sym,
-            tv_symbol=tv,
-            rsi_1m=rsi_1m,
-            rsi_1w=rsi_1w,
-            rsi_1d=rsi_1d,
-            rsi_4h=rsi_4h,
-            rsi_1h=rsi_1h,
-            reasons=reasons,
-        )
-
-        if qualifies(item):
-            items.append(item)
+        if reasons:
+            items.append(
+                DipItem(
+                    symbol=sym,
+                    tv_symbol=tv,
+                    rsi_1m=rsi_1m,
+                    rsi_1w=rsi_1w,
+                    rsi_1d=rsi_1d,
+                    rsi_4h=rsi_4h,
+                    rsi_1h=rsi_1h,
+                    reasons=reasons,
+                )
+            )
 
     elapsed = round(time.time() - t0, 2)
     meta = {
@@ -204,7 +190,7 @@ def build_diplist() -> Tuple[List[DipItem], Dict[str, Any]]:
 def save_diplist(path: str, items: List[DipItem], meta: Dict[str, Any]) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     payload = {
-        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+        "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
         "items": [asdict(x) for x in items],
         "meta": meta,
     }
