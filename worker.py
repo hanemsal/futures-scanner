@@ -149,7 +149,7 @@ def run_diplist(manual=False):
 
     generate_html(data)
 
-    url = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}/diplist"
+    url = f"https://{os.getenv('RENDER_SERVICE_NAME')}.onrender.com/diplist"
 
     send_message(
 f"""✅ DipList hazır
@@ -219,7 +219,7 @@ def telegram_loop():
                         send_message("Diplist bulunamadı.")
                         continue
 
-                    url = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}/diplist"
+                    url = f"https://{os.getenv('RENDER_SERVICE_NAME')}.onrender.com/diplist"
 
                     send_message(
 f"""Son DipList
