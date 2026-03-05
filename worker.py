@@ -30,6 +30,9 @@ def format_items(payload, top_n: int = TOP_N) -> str:
     lines.append(
         f"🔎 Scanned: {meta.get('symbols_scanned')} | Dip: {meta.get('dip_count')} | Err: {meta.get('errors')} | t={meta.get('elapsed_sec')}s"
     )
+    lines.append(
+        f"✅ Pass: 1M={meta.get('pass_1m')} 1W={meta.get('pass_1w')} 1D={meta.get('pass_1d')} 4H={meta.get('pass_4h')} 1H={meta.get('pass_1h')} ALL={meta.get('pass_all')}"
+    )
     lines.append("")
 
     for it in items[:top_n]:
@@ -107,12 +110,10 @@ def main():
 
                 cmd = text.strip()
 
-                # Sistemden bağımsız: son kaydı göster
                 if cmd == "/diplist":
                     payload = load_diplist(STORAGE_PATH)
                     send_message(format_items(payload))
 
-                # Sistemden bağımsız: anında üret
                 elif cmd.startswith("/diplist"):
                     parts = cmd.split()
                     if len(parts) >= 2 and parts[1].lower() == "now":
@@ -121,7 +122,6 @@ def main():
                         send_message("Kullanım: /diplist  veya  /diplist now")
 
         except requests.exceptions.ReadTimeout:
-            # long polling: normal
             continue
         except Exception as e:
             send_message(f"⚠️ Worker hata: {type(e).__name__}")
