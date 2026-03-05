@@ -130,6 +130,14 @@ def build_diplist() -> Tuple[List[DipItem], Dict[str, Any]]:
     items: List[DipItem] = []
     errors = 0
 
+    # PASS DEBUG sayaçları
+    c_1m = 0
+    c_1w = 0
+    c_1d = 0
+    c_4h = 0
+    c_1h = 0
+    c_all = 0
+
     for sym in symbols:
         tv = f"{sym}.P"
 
@@ -152,7 +160,20 @@ def build_diplist() -> Tuple[List[DipItem], Dict[str, Any]]:
         cond_4h = (rsi_4h is not None) and (rsi_4h <= RSI_4H_MAX)
         cond_1h = (rsi_1h is not None) and (rsi_1h <= RSI_1H_MAX)
 
-        if not (cond_1m and cond_1w and cond_1d and cond_4h and cond_1h):
+        # PASS sayaçları
+        if cond_1m:
+            c_1m += 1
+        if cond_1w:
+            c_1w += 1
+        if cond_1d:
+            c_1d += 1
+        if cond_4h:
+            c_4h += 1
+        if cond_1h:
+            c_1h += 1
+        if cond_1m and cond_1w and cond_1d and cond_4h and cond_1h:
+            c_all += 1
+        else:
             continue
 
         # reasons: hangi şartlar tuttu
@@ -190,6 +211,13 @@ def build_diplist() -> Tuple[List[DipItem], Dict[str, Any]]:
         "dip_count": len(items),
         "errors": errors,
         "elapsed_sec": elapsed,
+        # PASS DEBUG meta
+        "pass_1m": c_1m,
+        "pass_1w": c_1w,
+        "pass_1d": c_1d,
+        "pass_4h": c_4h,
+        "pass_1h": c_1h,
+        "pass_all": c_all,
     }
     return items, meta
 
