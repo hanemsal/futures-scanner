@@ -1,131 +1,220 @@
 import os
 import time
-from zoneinfo import ZoneInfo
-
-import requests
-from apscheduler.schedulers.background import BackgroundScheduler
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from diplist import build_diplist, save_diplist, load_diplist
-from telegram_bot import send_message, get_updates, is_allowed_chat, extract_text
+from telegram_bot import send_message, get_updates
 
-STORAGE_PATH = os.getenv("STORAGE_PATH", "/var/data/diplist.json")
+STORAGE_PATH = os.getenv("STORAGE_PATH", "/tmp/diplist.json")
+HTML_PATH = "/tmp/diplist.html"
 
-ENABLE_SCHEDULE = os.getenv("ENABLE_SCHEDULE", "0") == "1"
-SCHEDULE_TIMES = os.getenv("DIPLIST_SCHEDULE", "02:00,14:00,20:00")
-TZ_NAME = os.getenv("TZ_NAME", "Europe/Istanbul")
+PORT = int(os.getenv("PORT", "10000"))
 
-TOP_N = int(os.getenv("DIPLIST_TOP_N", "40"))
-
-
-def format_items(payload, top_n: int = TOP_N) -> str:
-    if not payload:
-        return "DipList bulunamadı. Önce /diplist now ile üret."
-
-    meta = payload.get("meta", {})
-    items = payload.get("items", [])
-    gen = payload.get("generated_at_utc", "?")
-
-    lines = []
-    lines.append(f"📌 DipList (UTC): {gen}")
-    lines.append(
-        f"🔎 Scanned: {meta.get('symbols_scanned')} | Dip: {meta.get('dip_count')} | Err: {meta.get('errors')} | t={meta.get('elapsed_sec')}s"
-    )
-    lines.append(
-        f"✅ Pass: 1M={meta.get('pass_1m')} 1W={meta.get('pass_1w')} 1D={meta.get('pass_1d')} 4H={meta.get('pass_4h')} 1H={meta.get('pass_1h')} ALL={meta.get('pass_all')}"
-    )
-    lines.append("")
-
-    for it in items[:top_n]:
-        sym = it.get("tv_symbol") or it.get("symbol")
-        r1m = it.get("rsi_1m")
-        r1w = it.get("rsi_1w")
-        r1d = it.get("rsi_1d")
-        r4h = it.get("rsi_4h")
-        r1h = it.get("rsi_1h")
-        reasons = ",".join(it.get("reasons", []))[:180]
-        lines.append(f"{sym} | 1M:{r1m} 1W:{r1w} 1D:{r1d} 4H:{r4h} 1H:{r1h} | {reasons}")
-
-    if len(items) > top_n:
-        lines.append("")
-        lines.append(f"… toplam {len(items)} coin. (Top {top_n} gösterildi)")
-    return "\n".join(lines)
+SCHEDULE_HOURS = [2, 14, 20]
 
 
-def run_diplist_and_store(manual: bool = False) -> None:
-    tag = "MANUEL" if manual else "SCHEDULE"
-    send_message(f"⏳ DipList başlıyor ({tag})…")
+def generate_html(data):
+
+    rows = []
+
+    for x in data["items"]:
+
+        rows.append(f"""
+<tr>
+<td>{x['symbol']}</td>
+<td>{x['rsi_1m']}</td>
+<td>{x['rsi_1w']}</td>
+<td>{x['rsi_1d']}</td>
+<td>{x['rsi_4h']}</td>
+<td>{x['rsi_1h']}</td>
+<td>{",".join(x['triggers'])}</td>
+</tr>
+""")
+
+    html = f"""
+<html>
+<head>
+<meta charset="utf-8">
+<title>DipList</title>
+<style>
+body {{ font-family: Arial; background:#111; color:#eee }}
+table {{ border-collapse: collapse; width:100% }}
+td,th {{ border:1px solid #333; padding:6px }}
+th {{ background:#222 }}
+</style>
+</head>
+
+<body>
+
+<h2>DipList</h2>
+
+<p>Toplam Coin: {len(data["items"])}</p>
+
+<table>
+
+<tr>
+<th>Symbol</th>
+<th>1M</th>
+<th>1W</th>
+<th>1D</th>
+<th>4H</th>
+<th>1H</th>
+<th>Trigger</th>
+</tr>
+
+{''.join(rows)}
+
+</table>
+
+</body>
+</html>
+"""
+
+    with open(HTML_PATH, "w", encoding="utf-8") as f:
+        f.write(html)
+
+
+class Handler(BaseHTTPRequestHandler):
+
+    def do_GET(self):
+
+        if self.path == "/diplist":
+
+            if not os.path.exists(HTML_PATH):
+
+                self.send_response(404)
+                self.end_headers()
+                self.wfile.write(b"No diplist yet")
+                return
+
+            self.send_response(200)
+            self.send_header("Content-type", "text/html")
+            self.end_headers()
+
+            with open(HTML_PATH, "rb") as f:
+                self.wfile.write(f.read())
+
+        else:
+
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"Futures Scanner Running")
+
+
+def run_web():
+
+    server = HTTPServer(("0.0.0.0", PORT), Handler)
+    server.serve_forever()
+
+
+def run_diplist(manual=False):
+
+    if manual:
+        send_message("⏳ DipList başlıyor (MANUEL)...")
 
     items, meta = build_diplist()
+
     save_diplist(STORAGE_PATH, items, meta)
 
-    payload = load_diplist(STORAGE_PATH)
-    send_message("✅ DipList hazır.\n\n" + format_items(payload))
+    data = load_diplist(STORAGE_PATH)
+
+    generate_html(data)
+
+    url = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}/diplist"
+
+    send_message(
+        f"""✅ DipList hazır
+
+Scanned: {meta['symbols_scanned']}
+Dip: {meta['dip_count']}
+Time: {meta['elapsed_sec']}s
+
+İncele:
+{url}
+"""
+    )
 
 
-def setup_scheduler() -> BackgroundScheduler:
-    tz = ZoneInfo(TZ_NAME)
-    sched = BackgroundScheduler(timezone=tz)
+def scheduler_loop():
 
-    for t in [x.strip() for x in SCHEDULE_TIMES.split(",") if x.strip()]:
-        hh, mm = t.split(":")
-        sched.add_job(
-            func=run_diplist_and_store,
-            trigger="cron",
-            hour=int(hh),
-            minute=int(mm),
-            id=f"diplist_{hh}{mm}",
-            replace_existing=True,
-        )
+    last_run = None
 
-    sched.start()
-    return sched
+    while True:
+
+        now = time.localtime()
+
+        if now.tm_hour in SCHEDULE_HOURS and now.tm_min == 0:
+
+            key = f"{now.tm_year}-{now.tm_yday}-{now.tm_hour}"
+
+            if key != last_run:
+
+                run_diplist(False)
+
+                last_run = key
+
+        time.sleep(30)
 
 
-def main():
-    send_message("🤖 Worker başladı. Komutlar: /diplist  |  /diplist now")
-
-    if ENABLE_SCHEDULE:
-        setup_scheduler()
-        send_message(f"⏰ Schedule aktif ({TZ_NAME}) -> {SCHEDULE_TIMES}")
+def telegram_loop():
 
     offset = None
 
     while True:
+
         try:
-            data = get_updates(offset=offset, timeout_sec=25)
 
-            if not data.get("ok"):
-                time.sleep(1)
-                continue
+            data = get_updates(offset)
 
-            for upd in data.get("result", []):
-                offset = upd["update_id"] + 1
+            for u in data.get("result", []):
 
-                if not is_allowed_chat(upd):
-                    continue
+                offset = u["update_id"] + 1
 
-                text = extract_text(upd)
-                if not text:
-                    continue
+                text = u["message"].get("text", "")
 
-                cmd = text.strip()
+                if text.startswith("/diplist now"):
 
-                if cmd == "/diplist":
-                    payload = load_diplist(STORAGE_PATH)
-                    send_message(format_items(payload))
+                    run_diplist(True)
 
-                elif cmd.startswith("/diplist"):
-                    parts = cmd.split()
-                    if len(parts) >= 2 and parts[1].lower() == "now":
-                        run_diplist_and_store(manual=True)
-                    else:
-                        send_message("Kullanım: /diplist  veya  /diplist now")
+                elif text.startswith("/diplist"):
 
-        except requests.exceptions.ReadTimeout:
-            continue
+                    data = load_diplist(STORAGE_PATH)
+
+                    if not data:
+                        send_message("Diplist bulunamadı.")
+                        continue
+
+                    url = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}/diplist"
+
+                    send_message(
+                        f"""
+Son DipList
+
+Toplam Coin: {len(data["items"])}
+
+İncele:
+{url}
+"""
+                    )
+
         except Exception as e:
-            send_message(f"⚠️ Worker hata: {type(e).__name__}")
-            time.sleep(2)
+
+            print("Telegram hata:", e)
+
+        time.sleep(2)
+
+
+def main():
+
+    send_message("🤖 Worker başladı. Komutlar: /diplist | /diplist now")
+
+    send_message("⏰ Schedule aktif (Europe/Istanbul) -> 02:00,14:00,20:00")
+
+    threading.Thread(target=run_web, daemon=True).start()
+    threading.Thread(target=scheduler_loop, daemon=True).start()
+
+    telegram_loop()
 
 
 if __name__ == "__main__":
