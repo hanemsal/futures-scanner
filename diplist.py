@@ -10,10 +10,11 @@ import aiohttp
 BINANCE_FAPI = os.getenv("BINANCE_FAPI", "https://fapi.binance.com").rstrip("/")
 
 KLINE_LIMIT = int(os.getenv("KLINE_LIMIT", "120"))
-SCAN_THREADS = int(os.getenv("SCAN_THREADS", "20"))  # Render için 20 stabil
+SCAN_THREADS = int(os.getenv("SCAN_THREADS", "20"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "8"))
 RETRY = int(os.getenv("REQUEST_RETRY", "2"))
-MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "0"))  # 0 => hepsi
+MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "0"))
+STORAGE_PATH = os.getenv("STORAGE_PATH", "/tmp/diplist.json")
 
 INTERVALS = {
     "1M": "1M",
@@ -23,16 +24,22 @@ INTERVALS = {
     "1H": "1h",
 }
 
-# Eşikler (senin Model 1)
-THRESH = {"1M": 10.0, "1W": 20.0, "1D": 30.0, "4H": 30.0, "1H": 30.0}
+THRESH = {
+    "1M": 10.0,
+    "1W": 20.0,
+    "1D": 30.0,
+    "4H": 30.0,
+    "1H": 30.0,
+}
 
 
 def calc_rsi(closes: List[float], period: int = 14) -> Optional[float]:
     if len(closes) < period + 2:
         return None
 
-    gains = []
-    losses = []
+    gains: List[float] = []
+    losses: List[float] = []
+
     for i in range(1, len(closes)):
         diff = closes[i] - closes[i - 1]
         if diff >= 0:
@@ -49,57 +56,80 @@ def calc_rsi(closes: List[float], period: int = 14) -> Optional[float]:
         return 100.0
 
     rs = avg_gain / avg_loss
-    return 100.0 - (100.0 / (1.0 + rs))
+    return round(100.0 - (100.0 / (1.0 + rs)), 2)
 
 
 def get_symbols() -> List[str]:
     url = f"{BINANCE_FAPI}/fapi/v1/exchangeInfo"
-    data = requests.get(url, timeout=20).json()
 
-    out = []
+    try:
+        resp = requests.get(url, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        print("get_symbols error:", e)
+        return []
+
+    out: List[str] = []
+
     for s in data.get("symbols", []):
-        if s.get("contractType") != "PERPETUAL":
+        try:
+            if s.get("contractType") != "PERPETUAL":
+                continue
+            if s.get("quoteAsset") != "USDT":
+                continue
+            if s.get("status") != "TRADING":
+                continue
+            out.append(s["symbol"])
+        except Exception:
             continue
-        if s.get("quoteAsset") != "USDT":
-            continue
-        if s.get("status") != "TRADING":
-            continue
-        out.append(s["symbol"])
 
-    if MAX_SYMBOLS and MAX_SYMBOLS > 0:
+    out = sorted(out)
+
+    if MAX_SYMBOLS > 0:
         out = out[:MAX_SYMBOLS]
+
     return out
 
 
-async def _fetch_klines(session: aiohttp.ClientSession, symbol: str, interval: str) -> Optional[List[float]]:
+async def _fetch_klines(
+    session: aiohttp.ClientSession,
+    symbol: str,
+    interval: str,
+) -> Optional[List[float]]:
     url = f"{BINANCE_FAPI}/fapi/v1/klines"
     params = {"symbol": symbol, "interval": interval, "limit": KLINE_LIMIT}
 
-    last_err = None
     for attempt in range(RETRY + 1):
         try:
-            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)) as resp:
+            timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+            async with session.get(url, params=params, timeout=timeout) as resp:
                 if resp.status != 200:
-                    last_err = f"HTTP {resp.status}"
-                    await resp.release()
-                    await asyncio.sleep(0.2 * (attempt + 1))
+                    await asyncio.sleep(0.25 * (attempt + 1))
                     continue
-                data = await resp.json()
-                closes = [float(x[4]) for x in data]
-                return closes
-        except Exception as e:
-            last_err = str(e)
-            await asyncio.sleep(0.2 * (attempt + 1))
-            continue
 
-    # timeout / network fail => None
+                data = await resp.json()
+
+                closes: List[float] = []
+                for row in data:
+                    try:
+                        closes.append(float(row[4]))
+                    except Exception:
+                        continue
+
+                return closes
+        except Exception:
+            await asyncio.sleep(0.25 * (attempt + 1))
+
     return None
 
 
-async def _scan_symbol(session: aiohttp.ClientSession, symbol: str) -> Optional[Dict[str, Any]]:
+async def _scan_symbol(
+    session: aiohttp.ClientSession,
+    symbol: str,
+) -> Optional[Dict[str, Any]]:
     rsi_map: Dict[str, Optional[float]] = {}
 
-    # 5 timeframe ardışık (aynı symbol için), ama global concurrency pool içinde hızlı çalışır
     for key, interval in INTERVALS.items():
         closes = await _fetch_klines(session, symbol, interval)
         if not closes:
@@ -109,16 +139,12 @@ async def _scan_symbol(session: aiohttp.ClientSession, symbol: str) -> Optional[
 
     triggers: List[str] = []
 
-    # “değer almayan” (None/NaN) olanlar DAHİL edilsin istiyorsun:
-    # -> TradingView’de “—” gördüğün şey bizde None döner.
-    # -> Koşul: (rsi <= eşik) veya (rsi is None) ise trigger.
     for tf, limit in THRESH.items():
-        v = rsi_map.get(tf)
-        if v is None:
-            triggers.append(tf)  # değer almayan dahil
-        else:
-            if v <= limit:
-                triggers.append(tf)
+        value = rsi_map.get(tf)
+        if value is None:
+            triggers.append(tf)  # değer almayan coinleri dahil et
+        elif value <= limit:
+            triggers.append(tf)
 
     if not triggers:
         return None
@@ -146,10 +172,10 @@ async def _scan_all_async(symbols: List[str]) -> Tuple[List[Dict[str, Any]], Dic
     )
 
     async with aiohttp.ClientSession(connector=connector) as session:
-        # bounded worker pool: 544 task’i aynı anda yaratıp RAM şişirmiyoruz
         q: asyncio.Queue[str] = asyncio.Queue()
-        for s in symbols:
-            q.put_nowait(s)
+
+        for sym in symbols:
+            q.put_nowait(sym)
 
         async def worker() -> None:
             while True:
@@ -157,20 +183,24 @@ async def _scan_all_async(symbols: List[str]) -> Tuple[List[Dict[str, Any]], Dic
                     sym = q.get_nowait()
                 except asyncio.QueueEmpty:
                     return
+
                 try:
                     res = await _scan_symbol(session, sym)
                     if res:
                         results.append(res)
+
                         for tf in res["triggers"]:
                             if tf in passed:
                                 passed[tf] += 1
-                        if set(res["triggers"]) == set(["1M", "1W", "1D", "4H", "1H"]):
+
+                        if set(res["triggers"]) == {"1M", "1W", "1D", "4H", "1H"}:
                             passed["ALL"] += 1
                 finally:
                     q.task_done()
 
         workers = [asyncio.create_task(worker()) for _ in range(SCAN_THREADS)]
         await q.join()
+
         for w in workers:
             w.cancel()
 
@@ -191,14 +221,14 @@ def build_diplist() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         "passed": passed,
         "utc_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
-    import json
-    import os
 
-    STORAGE_PATH = os.getenv("STORAGE_PATH", "/tmp/diplist.json")
+    # web.py bunu doğrudan okuyacak
+    try:
+        with open(STORAGE_PATH, "w", encoding="utf-8") as f:
+            json.dump(results, f, ensure_ascii=False)
+    except Exception as e:
+        print("write STORAGE_PATH error:", e)
 
-    with open(STORAGE_PATH, "w") as f:
-        json.dump(results, f)
-    
     return results, meta
 
 
@@ -212,24 +242,33 @@ def fmt_rsi(v: Optional[float]) -> str:
 
 
 def render_text(results: List[Dict[str, Any]], meta: Dict[str, Any], top_n: int = 40) -> str:
-    lines = []
-    lines.append(f"✅ DipList hazır")
+    lines: List[str] = []
+    lines.append("✅ DipList hazır")
     lines.append(f"Scanned: {meta['symbols_scanned']}")
     lines.append(f"Dip: {meta['dip_count']}")
     lines.append(f"Time: {meta['elapsed_sec']}s")
+
     p = meta.get("passed", {})
-    lines.append(f"Pass: 1M={p.get('1M',0)} 1W={p.get('1W',0)} 1D={p.get('1D',0)} 4H={p.get('4H',0)} 1H={p.get('1H',0)} ALL={p.get('ALL',0)}")
+    lines.append(
+        f"Pass: 1M={p.get('1M', 0)} 1W={p.get('1W', 0)} 1D={p.get('1D', 0)} "
+        f"4H={p.get('4H', 0)} 1H={p.get('1H', 0)} ALL={p.get('ALL', 0)}"
+    )
     lines.append("")
 
-    # Stable sıralama: en çok trigger alan üstte
-    results_sorted = sorted(results, key=lambda x: (-len(x.get("triggers", [])), x["symbol"]))
+    results_sorted = sorted(
+        results,
+        key=lambda x: (-len(x.get("triggers", [])), x.get("symbol", "")),
+    )
 
-    show = results_sorted[:top_n]
-    for r in show:
+    for r in results_sorted[:top_n]:
         lines.append(
             f"{r['symbol']} | "
-            f"1M:{fmt_rsi(r['rsi_1m'])} 1W:{fmt_rsi(r['rsi_1w'])} 1D:{fmt_rsi(r['rsi_1d'])} 4H:{fmt_rsi(r['rsi_4h'])} 1H:{fmt_rsi(r['rsi_1h'])} | "
-            f"TRIG:{','.join(r['triggers'])}"
+            f"1M:{fmt_rsi(r.get('rsi_1m'))} "
+            f"1W:{fmt_rsi(r.get('rsi_1w'))} "
+            f"1D:{fmt_rsi(r.get('rsi_1d'))} "
+            f"4H:{fmt_rsi(r.get('rsi_4h'))} "
+            f"1H:{fmt_rsi(r.get('rsi_1h'))} | "
+            f"TRIG:{','.join(r.get('triggers', []))}"
         )
 
     lines.append("")
