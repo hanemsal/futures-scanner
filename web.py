@@ -1,71 +1,51 @@
 import os
 import json
-from flask import Flask, jsonify, render_template_string
+import threading
+import time
+from flask import Flask, Response
 
 STORAGE_PATH = os.getenv("STORAGE_PATH", "/tmp/diplist.json")
 
 app = Flask(__name__)
 
-HTML = """
-<html>
-<head>
-<title>DipList</title>
-<style>
-body {background:#111;color:#eee;font-family:Arial}
-table {border-collapse:collapse;width:100%}
-td,th {border:1px solid #333;padding:6px}
-th {background:#222}
-</style>
-</head>
-<body>
 
-<h2>DipList</h2>
+def scanner_loop():
+    while True:
+        # burada diplist üretilecek
+        diplist = {
+            "coins": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+            "time": time.time()
+        }
 
-<table>
-<tr>
-<th>Symbol</th>
-<th>1M</th>
-<th>1W</th>
-<th>1D</th>
-<th>4H</th>
-<th>1H</th>
-<th>Triggers</th>
-</tr>
+        with open(STORAGE_PATH, "w") as f:
+            json.dump(diplist, f)
 
-{% for c in coins %}
-<tr>
-<td>{{c.symbol}}</td>
-<td>{{c.rsi_1m}}</td>
-<td>{{c.rsi_1w}}</td>
-<td>{{c.rsi_1d}}</td>
-<td>{{c.rsi_4h}}</td>
-<td>{{c.rsi_1h}}</td>
-<td>{{c.triggers}}</td>
-</tr>
-{% endfor %}
+        time.sleep(60)
 
-</table>
 
-</body>
-</html>
-"""
+@app.route("/")
+def home():
+    return "Scanner running"
+
 
 @app.route("/diplist")
 def diplist():
-
     if not os.path.exists(STORAGE_PATH):
         return "Diplist not generated yet"
 
     with open(STORAGE_PATH) as f:
         data = json.load(f)
 
-    coins = data["results"]
+    text = ""
 
-    return render_template_string(HTML, coins=coins)
+    for c in data["coins"]:
+        text += c + "\n"
 
-@app.route("/")
-def home():
-    return "Scanner running"
+    return Response(text, mimetype="text/plain")
+
 
 if __name__ == "__main__":
+    t = threading.Thread(target=scanner_loop)
+    t.start()
+
     app.run(host="0.0.0.0", port=10000)
