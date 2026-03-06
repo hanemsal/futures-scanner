@@ -192,11 +192,11 @@ def build_diplist() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         "utc_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     import json
-import os
+    import os
 
-STORAGE_PATH = os.getenv("STORAGE_PATH", "/tmp/diplist.json")
+    STORAGE_PATH = os.getenv("STORAGE_PATH", "/tmp/diplist.json")
 
-with open(STORAGE_PATH, "w") as f:
+    with open(STORAGE_PATH, "w") as f:
     json.dump(results, f)
     
     return results, meta
