@@ -53,7 +53,6 @@ def calc_rsi(closes, period=14):
         return 100
 
     rs = avg_gain / avg_loss
-
     rsi = 100 - (100 / (1 + rs))
 
     return round(rsi, 2)
@@ -73,7 +72,6 @@ def get_klines(symbol, interval):
     }
 
     r = requests.get(url, params=params, timeout=10)
-
     data = r.json()
 
     closes = [float(x[4]) for x in data]
@@ -147,7 +145,6 @@ def scanner_loop():
 # -----------------------------
 @app.route("/")
 def home():
-
     return "Scanner running"
 
 
@@ -162,6 +159,9 @@ def diplist():
 
     with open(STORAGE_PATH) as f:
         data = json.load(f)
+
+    # 🔥 EN DİP → ÜSTTE
+    data = sorted(data, key=lambda x: x["rsi"])
 
     html = """
 
