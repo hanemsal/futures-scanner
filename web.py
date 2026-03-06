@@ -1,57 +1,159 @@
 import os
-import json
 import time
+import json
 import threading
+import requests
 from flask import Flask
 
 app = Flask(__name__)
 
 STORAGE_PATH = os.getenv("STORAGE_PATH", "/tmp/diplist.json")
 
+BINANCE_FAPI = "https://fapi.binance.com"
 
-# -------------------------------
-# TEST SCANNER (yerine gerçek scanner gelecek)
-# -------------------------------
+COINS = [
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+    "BNBUSDT",
+    "XRPUSDT"
+]
 
+TIMEFRAMES = {
+    "1M": "1M",
+    "1W": "1w",
+    "1D": "1d",
+    "4H": "4h",
+    "1H": "1h"
+}
+
+
+# -----------------------------
+# RSI HESAPLAMA
+# -----------------------------
+def calc_rsi(closes, period=14):
+
+    gains = []
+    losses = []
+
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i-1]
+
+        if diff >= 0:
+            gains.append(diff)
+            losses.append(0)
+        else:
+            gains.append(0)
+            losses.append(abs(diff))
+
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+
+    if avg_loss == 0:
+        return 100
+
+    rs = avg_gain / avg_loss
+
+    rsi = 100 - (100 / (1 + rs))
+
+    return round(rsi, 2)
+
+
+# -----------------------------
+# KLINE ÇEK
+# -----------------------------
+def get_klines(symbol, interval):
+
+    url = f"{BINANCE_FAPI}/fapi/v1/klines"
+
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "limit": 100
+    }
+
+    r = requests.get(url, params=params, timeout=10)
+
+    data = r.json()
+
+    closes = [float(x[4]) for x in data]
+
+    return closes
+
+
+# -----------------------------
+# FİYAT ÇEK
+# -----------------------------
+def get_price(symbol):
+
+    url = f"{BINANCE_FAPI}/fapi/v1/ticker/price"
+
+    params = {"symbol": symbol}
+
+    r = requests.get(url, params=params, timeout=10)
+
+    return float(r.json()["price"])
+
+
+# -----------------------------
+# SCANNER
+# -----------------------------
 def scanner_loop():
 
     while True:
 
-        coins = [
-            "BTCUSDT",
-            "ETHUSDT",
-            "SOLUSDT",
-            "BNBUSDT",
-            "XRPUSDT"
-        ]
+        results = []
 
-        data = {
-            "coins": coins,
-            "time": time.time()
-        }
+        for coin in COINS:
+
+            try:
+
+                price = get_price(coin)
+
+                closes = get_klines(coin, "1h")
+
+                rsi = calc_rsi(closes)
+
+                tf_result = {}
+
+                for tf_name, tf_val in TIMEFRAMES.items():
+
+                    closes_tf = get_klines(coin, tf_val)
+
+                    rsi_tf = calc_rsi(closes_tf)
+
+                    tf_result[tf_name] = rsi_tf < 30
+
+                results.append({
+                    "coin": coin,
+                    "price": price,
+                    "rsi": rsi,
+                    "tf": tf_result
+                })
+
+            except Exception as e:
+                print("ERROR", coin, e)
 
         with open(STORAGE_PATH, "w") as f:
-            json.dump(data, f)
+            json.dump(results, f)
 
-        print("Diplist updated")
+        print("scanner updated")
 
-        time.sleep(60)
+        time.sleep(300)
 
 
-# -------------------------------
+# -----------------------------
 # HOME
-# -------------------------------
-
+# -----------------------------
 @app.route("/")
 def home():
 
-    return "Futures Scanner Running"
+    return "Scanner running"
 
 
-# -------------------------------
-# DIPLIST PANEL
-# -------------------------------
-
+# -----------------------------
+# PANEL
+# -----------------------------
 @app.route("/diplist")
 def diplist():
 
@@ -64,7 +166,6 @@ def diplist():
     html = """
 
     <html>
-
     <head>
 
     <title>Futures Dip Scanner</title>
@@ -84,7 +185,7 @@ def diplist():
     table{
         border-collapse:collapse;
         margin:auto;
-        width:80%;
+        width:90%;
     }
 
     th,td{
@@ -127,6 +228,7 @@ def diplist():
 
     <tr>
         <th>Coin</th>
+        <th>Price</th>
         <th>RSI</th>
         <th>1M</th>
         <th>1W</th>
@@ -138,24 +240,29 @@ def diplist():
 
     """
 
-    for coin in data["coins"]:
+    for row in data:
+
+        def mark(v):
+            return '<span class="ok">✓</span>' if v else '<span class="no">✗</span>'
 
         html += f"""
 
         <tr>
 
-        <td>{coin}</td>
+        <td>{row["coin"]}</td>
 
-        <td>--</td>
+        <td>{row["price"]}</td>
 
-        <td class="ok">✓</td>
-        <td class="ok">✓</td>
-        <td class="ok">✓</td>
-        <td class="ok">✓</td>
-        <td class="ok">✓</td>
+        <td>{row["rsi"]}</td>
+
+        <td>{mark(row["tf"]["1M"])}</td>
+        <td>{mark(row["tf"]["1W"])}</td>
+        <td>{mark(row["tf"]["1D"])}</td>
+        <td>{mark(row["tf"]["4H"])}</td>
+        <td>{mark(row["tf"]["1H"])}</td>
 
         <td>
-        <a href="https://www.binance.com/en/futures/{coin}" target="_blank">
+        <a href="https://www.binance.com/en/futures/{row["coin"]}" target="_blank">
         Chart
         </a>
         </td>
@@ -164,23 +271,14 @@ def diplist():
 
         """
 
-    html += """
-
-    </table>
-
-    </body>
-
-    </html>
-
-    """
+    html += "</table></body></html>"
 
     return html
 
 
-# -------------------------------
-# START THREAD
-# -------------------------------
-
+# -----------------------------
+# START
+# -----------------------------
 if __name__ == "__main__":
 
     t = threading.Thread(target=scanner_loop)
