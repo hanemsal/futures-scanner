@@ -117,14 +117,20 @@ def check_signal(symbol):
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
-    if pd.isna(last["ema123"]) or pd.isna(last["kama13"]) or pd.isna(prev["kama13"]) or pd.isna(last["macd"]) or pd.isna(last["vol_ma"]):
+    if (
+        pd.isna(last["ema123"])
+        or pd.isna(last["kama13"])
+        or pd.isna(prev["kama13"])
+        or pd.isna(last["macd"])
+        or pd.isna(last["vol_ma"])
+    ):
         return False
 
     long_ok = (
         last["close"] > last["ema123"]
-        and last["kama13"] > prev["kama13"]
-        and last["macd"] >= 0
-        and last["volume"] >= last["vol_ma"]
+        and last["kama13"] > prev["kama13"]   # KAMA13 slope yukarı
+        and last["macd"] >= 0                 # MACD 0 veya üstü
+        and last["volume"] >= last["vol_ma"]  # Volume >= Volume MA
     )
 
     if long_ok:
@@ -149,9 +155,9 @@ def check_signal(symbol):
 def scan():
     try:
         symbols = get_symbols()
-        print("Total symbols:", len(symbols), flush=True)
+        print(f"Total symbols: {len(symbols)}", flush=True)
     except Exception as e:
-        print("get_symbols error:", e, flush=True)
+        print(f"get_symbols error: {e}", flush=True)
         return
 
     signal_count = 0
@@ -175,6 +181,6 @@ if __name__ == "__main__":
         try:
             scan()
         except Exception as e:
-            print("scan loop error:", e, flush=True)
+            print(f"scan loop error: {e}", flush=True)
 
         time.sleep(INTERVAL_SEC)
