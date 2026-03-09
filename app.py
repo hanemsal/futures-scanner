@@ -140,7 +140,7 @@ def check_signal(symbol):
             f"• Volume ≥ Volume MA"
         )
         send_telegram(message)
-        print(f"SIGNAL: {symbol} @ {format_price(last['close'])}")
+        print(f"SIGNAL: {symbol} @ {format_price(last['close'])}", flush=True)
         return True
 
     return False
@@ -149,9 +149,9 @@ def check_signal(symbol):
 def scan():
     try:
         symbols = get_symbols()
-        print("Total symbols:", len(symbols))
+        print("Total symbols:", len(symbols), flush=True)
     except Exception as e:
-        print("get_symbols error:", e)
+        print("get_symbols error:", e, flush=True)
         return
 
     signal_count = 0
@@ -162,19 +162,19 @@ def scan():
             if ok:
                 signal_count += 1
         except Exception as e:
-            print(f"{symbol} signal error: {e}")
+            print(f"{symbol} signal error: {e}", flush=True)
 
-    print(f"Scan finished. Signals found: {signal_count}")
+    print(f"Scan finished. Signals found: {signal_count}", flush=True)
 
 
 if __name__ == "__main__":
-    print("Scanner started")
+    print("Scanner started", flush=True)
     send_telegram("🚀 Scanner aktif")
 
     while True:
         try:
             scan()
         except Exception as e:
-            print("scan loop error:", e)
+            print("scan loop error:", e, flush=True)
 
         time.sleep(INTERVAL_SEC)
