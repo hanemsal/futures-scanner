@@ -93,6 +93,31 @@ def format_price(price):
     return f"{price:.6f}"
 
 
+def get_btc_filter():
+    """
+    Hafif BTC filtresi:
+    BTC close > BTC EMA123 ise True döner.
+    """
+    df = get_klines("BTCUSDT")
+
+    close = df["close"]
+    df["ema123"] = EMAIndicator(close=close, window=123).ema_indicator()
+
+    last = df.iloc[-1]
+
+    if pd.isna(last["ema123"]):
+        return False
+
+    btc_ok = last["close"] > last["ema123"]
+
+    print(
+        f"BTC FILTER | close: {format_price(last['close'])} | ema123: {format_price(last['ema123'])} | pass: {btc_ok}",
+        flush=True
+    )
+
+    return btc_ok
+
+
 def process_symbol(symbol):
 
     global active_trades
@@ -147,6 +172,7 @@ def process_symbol(symbol):
             f"TF: 1H\n"
             f"Price: {format_price(price)}\n\n"
             f"Şartlar:\n"
+            f"• BTC > EMA123\n"
             f"• Price > EMA123\n"
             f"• KAMA13 slope ↑\n"
             f"• MACD ≥ 0\n"
@@ -189,6 +215,15 @@ def scan():
     symbols = get_symbols()
 
     print(f"Total symbols: {len(symbols)}", flush=True)
+
+    # Önce BTC filtresini kontrol et
+    btc_ok = get_btc_filter()
+
+    if not btc_ok:
+        print("BTC filter failed: BTC <= EMA123 | LONG taraması pas geçildi", flush=True)
+        return
+
+    print("BTC filter passed: LONG taraması devam ediyor", flush=True)
 
     for symbol in symbols:
 
