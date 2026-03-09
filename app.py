@@ -14,6 +14,10 @@ KLINE_LIMIT = 200
 # aktif trade takibi
 active_trades = {}
 
+# aynı kapanmış mumda tekrar sinyal atmamak için
+last_long_candle_sent = {}
+last_exit_candle_sent = {}
+
 
 def get_symbols():
     url = f"{BINANCE}/fapi/v1/exchangeInfo"
@@ -51,9 +55,12 @@ def get_klines(symbol):
 
     df = pd.DataFrame(data)
     df = df.iloc[:, 0:6]
-
     df.columns = ["time", "open", "high", "low", "close", "volume"]
 
+    df["time"] = df["time"].astype("int64")
+    df["open"] = df["open"].astype(float)
+    df["high"] = df["high"].astype(float)
+    df["low"] = df["low"].astype(float)
     df["close"] = df["close"].astype(float)
     df["volume"] = df["volume"].astype(float)
 
@@ -83,35 +90,33 @@ def kama(series, length=13):
 
 
 def format_price(price):
-
     if price >= 100:
         return f"{price:.2f}"
-
     if price >= 1:
         return f"{price:.4f}"
-
     return f"{price:.6f}"
 
 
 def get_btc_filter():
     """
-    Hafif BTC filtresi:
-    BTC close > BTC EMA123 ise True döner.
+    BTC filtresi sadece son kapanmış mumla çalışır.
+    BTC close[-2] > BTC EMA123[-2]
     """
     df = get_klines("BTCUSDT")
 
     close = df["close"]
     df["ema123"] = EMAIndicator(close=close, window=123).ema_indicator()
 
-    last = df.iloc[-1]
+    signal_candle = df.iloc[-2]  # son kapanmış mum
 
-    if pd.isna(last["ema123"]):
+    if pd.isna(signal_candle["ema123"]):
         return False
 
-    btc_ok = last["close"] > last["ema123"]
+    btc_ok = signal_candle["close"] > signal_candle["ema123"]
 
     print(
-        f"BTC FILTER | close: {format_price(last['close'])} | ema123: {format_price(last['ema123'])} | pass: {btc_ok}",
+        f"BTC FILTER | close: {format_price(signal_candle['close'])} | "
+        f"ema123: {format_price(signal_candle['ema123'])} | pass: {btc_ok}",
         flush=True
     )
 
@@ -119,52 +124,55 @@ def get_btc_filter():
 
 
 def process_symbol(symbol):
-
-    global active_trades
+    global active_trades, last_long_candle_sent, last_exit_candle_sent
 
     df = get_klines(symbol)
 
     close = df["close"]
 
     df["ema123"] = EMAIndicator(close=close, window=123).ema_indicator()
-
     df["kama13"] = kama(close, 13)
 
     macd = MACD(close=close)
-
     df["macd"] = macd.macd()
 
     stoch = StochRSIIndicator(close=close)
-
     df["stoch"] = stoch.stochrsi_k() * 100
 
     df["vol_ma"] = df["volume"].rolling(20).mean()
 
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-    prev2 = df.iloc[-3]
+    # SADECE kapanmış mumlar
+    signal_candle = df.iloc[-2]   # son kapanmış mum
+    prev = df.iloc[-3]            # bir önceki kapanmış mum
+    prev2 = df.iloc[-4]           # iki önceki kapanmış mum
 
-    # LONG koşulu
+    signal_time = str(int(signal_candle["time"]))
+
+    # LONG koşulu - kapanmış mum bazlı
     long_ok = (
-        last["close"] > last["ema123"]
-        and last["kama13"] > prev["kama13"]
-        and last["macd"] >= 0
-        and last["volume"] >= last["vol_ma"]
+        signal_candle["close"] > signal_candle["ema123"]
+        and signal_candle["kama13"] > prev["kama13"]
+        and signal_candle["macd"] >= 0
+        and signal_candle["volume"] >= signal_candle["vol_ma"]
+        and signal_candle["close"] > signal_candle["open"]   # kırmızı mumda long verme
     )
 
-    # EXIT koşulu
+    # EXIT koşulu - kapanmış mum bazlı
     exit_ok = (
-        last["kama13"] < prev["kama13"]
+        signal_candle["kama13"] < prev["kama13"]
         and prev["kama13"] < prev2["kama13"]
-        and last["stoch"] < 80
+        and signal_candle["stoch"] < 80
     )
 
     # LONG
     if long_ok and symbol not in active_trades:
+        # aynı kapanmış mumda tekrar LONG atma
+        if last_long_candle_sent.get(symbol) == signal_time:
+            return
 
-        price = last["close"]
-
+        price = signal_candle["close"]
         active_trades[symbol] = price
+        last_long_candle_sent[symbol] = signal_time
 
         msg = (
             f"🟢 LONG SIGNAL\n\n"
@@ -176,20 +184,24 @@ def process_symbol(symbol):
             f"• Price > EMA123\n"
             f"• KAMA13 slope ↑\n"
             f"• MACD ≥ 0\n"
-            f"• Volume ≥ Volume MA"
+            f"• Volume ≥ Volume MA\n"
+            f"• Green candle"
         )
 
         send_telegram(msg)
-
-        print(f"LONG: {symbol} @ {format_price(price)}", flush=True)
+        print(f"LONG: {symbol} @ {format_price(price)} | candle: {signal_time}", flush=True)
 
     # EXIT
     if symbol in active_trades and exit_ok:
+        # aynı kapanmış mumda tekrar EXIT atma
+        if last_exit_candle_sent.get(symbol) == signal_time:
+            return
 
         entry = active_trades[symbol]
-        exit_price = last["close"]
-
+        exit_price = signal_candle["close"]
         pnl = (exit_price - entry) / entry * 100
+
+        last_exit_candle_sent[symbol] = signal_time
 
         msg = (
             f"🔴 EXIT SIGNAL\n\n"
@@ -204,19 +216,15 @@ def process_symbol(symbol):
         )
 
         send_telegram(msg)
-
-        print(f"EXIT: {symbol}", flush=True)
+        print(f"EXIT: {symbol} @ {format_price(exit_price)} | candle: {signal_time}", flush=True)
 
         del active_trades[symbol]
 
 
 def scan():
-
     symbols = get_symbols()
-
     print(f"Total symbols: {len(symbols)}", flush=True)
 
-    # Önce BTC filtresini kontrol et
     btc_ok = get_btc_filter()
 
     if not btc_ok:
@@ -226,30 +234,20 @@ def scan():
     print("BTC filter passed: LONG taraması devam ediyor", flush=True)
 
     for symbol in symbols:
-
         try:
-
             process_symbol(symbol)
-
         except Exception as e:
-
             print(f"{symbol} error: {e}", flush=True)
 
 
 if __name__ == "__main__":
-
     print("Scanner started", flush=True)
-
     send_telegram("🚀 Scanner aktif")
 
     while True:
-
         try:
-
             scan()
-
         except Exception as e:
-
             print("scan error:", e, flush=True)
 
         time.sleep(INTERVAL_SEC)
