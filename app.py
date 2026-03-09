@@ -1,51 +1,70 @@
+import time
 import requests
 import pandas as pd
-import numpy as np
-import time
-from notify import send_telegram
 from ta.trend import EMAIndicator, MACD
-from ta.momentum import StochRSIIndicator
+
+from notify import send_telegram
 
 BINANCE = "https://fapi.binance.com"
-
 TF = "1h"
-INTERVAL = 300
+INTERVAL_SEC = 300
+KLINE_LIMIT = 200
 
 
 def get_symbols():
-
     url = f"{BINANCE}/fapi/v1/exchangeInfo"
-    data = requests.get(url).json()
+
+    try:
+        r = requests.get(url, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        raise ValueError(f"exchangeInfo request failed: {e}")
+
+    if not isinstance(data, dict):
+        raise ValueError(f"exchangeInfo dict dönmedi: {data}")
+
+    if "symbols" not in data:
+        raise ValueError(f"exchangeInfo içinde symbols yok: {data}")
 
     symbols = []
-
     for s in data["symbols"]:
-
-        if s["contractType"] == "PERPETUAL" and s["quoteAsset"] == "USDT":
-
-            symbols.append(s["symbol"])
+        try:
+            if (
+                s.get("contractType") == "PERPETUAL"
+                and s.get("quoteAsset") == "USDT"
+                and s.get("status") == "TRADING"
+            ):
+                symbols.append(s["symbol"])
+        except Exception:
+            continue
 
     return symbols
 
 
 def get_klines(symbol):
-
     url = f"{BINANCE}/fapi/v1/klines"
-
     params = {
         "symbol": symbol,
         "interval": TF,
-        "limit": 200
+        "limit": KLINE_LIMIT,
     }
 
-    data = requests.get(url, params=params).json()
+    r = requests.get(url, params=params, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+
+    if not isinstance(data, list):
+        raise ValueError(f"{symbol} kline hatası: {data}")
 
     df = pd.DataFrame(data)
+    df = df.iloc[:, 0:6]
+    df.columns = ["time", "open", "high", "low", "close", "volume"]
 
-    df = df.iloc[:,0:6]
-
-    df.columns = ["time","open","high","low","close","volume"]
-
+    df["time"] = df["time"].astype("int64")
+    df["open"] = df["open"].astype(float)
+    df["high"] = df["high"].astype(float)
+    df["low"] = df["low"].astype(float)
     df["close"] = df["close"].astype(float)
     df["volume"] = df["volume"].astype(float)
 
@@ -53,94 +72,98 @@ def get_klines(symbol):
 
 
 def kama(series, length=13):
+    change = series.diff(length).abs()
+    volatility = series.diff().abs().rolling(length).sum()
 
-    change = abs(series.diff(length))
-    volatility = abs(series.diff()).rolling(length).sum()
+    er = change / volatility.replace(0, pd.NA)
 
-    er = change / volatility
+    fast = 2 / (2 + 1)
+    slow = 2 / (30 + 1)
 
-    fast = 2/(2+1)
-    slow = 2/(30+1)
+    sc = (er * (fast - slow) + slow) ** 2
+    sc = sc.fillna(0)
 
-    sc = (er*(fast-slow)+slow)**2
+    kama_values = [series.iloc[0]]
 
-    kama = [series.iloc[0]]
+    for i in range(1, len(series)):
+        prev = kama_values[i - 1]
+        current = prev + sc.iloc[i] * (series.iloc[i] - prev)
+        kama_values.append(current)
 
-    for i in range(1,len(series)):
+    return pd.Series(kama_values, index=series.index)
 
-        kama.append(kama[i-1]+sc.iloc[i]*(series.iloc[i]-kama[i-1]))
 
-    return pd.Series(kama,index=series.index)
+def format_price(price):
+    if price >= 100:
+        return f"{price:.2f}"
+    if price >= 1:
+        return f"{price:.4f}"
+    return f"{price:.6f}"
 
 
 def check_signal(symbol):
-
     df = get_klines(symbol)
 
     close = df["close"]
 
-    df["ema123"] = EMAIndicator(close,123).ema_indicator()
+    df["ema123"] = EMAIndicator(close=close, window=123).ema_indicator()
+    df["kama13"] = kama(close, 13)
 
-    df["kama13"] = kama(close,13)
-
-    macd = MACD(close)
-
-    df["macd"] = macd.macd()
-
-    stoch = StochRSIIndicator(close)
-
-    df["stoch"] = stoch.stochrsi_k()
+    macd_obj = MACD(close=close)
+    df["macd"] = macd_obj.macd()
 
     df["vol_ma"] = df["volume"].rolling(20).mean()
 
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
-    if (
+    if pd.isna(last["ema123"]) or pd.isna(last["kama13"]) or pd.isna(prev["kama13"]) or pd.isna(last["macd"]) or pd.isna(last["vol_ma"]):
+        return
+
+    long_ok = (
         last["close"] > last["ema123"]
-        and last["kama13"] > prev["kama13"]
-        and last["macd"] >= 0
-        and last["volume"] > last["vol_ma"]
-    ):
+        and last["kama13"] > prev["kama13"]   # KAMA13 slope yukarı
+        and last["macd"] >= 0                 # MACD 0 veya üstü
+        and last["volume"] >= last["vol_ma"]  # volume >= volume MA
+    )
 
-        price = round(last["close"],5)
-
-        message = f"""🟢 LONG SIGNAL
-
-Coin: {symbol}
-TF: 1H
-
-Price: {price}
-
-Trend: EMA123 üstü
-KAMA slope: ↑
-MACD: pozitif
-"""
-
+    if long_ok:
+        message = (
+            f"🟢 LONG SIGNAL\n\n"
+            f"Coin: {symbol}\n"
+            f"TF: 1H\n"
+            f"Price: {format_price(last['close'])}\n\n"
+            f"Şartlar:\n"
+            f"• Price > EMA123\n"
+            f"• KAMA13 slope ↑\n"
+            f"• MACD ≥ 0\n"
+            f"• Volume ≥ Volume MA"
+        )
         send_telegram(message)
 
 
 def scan():
+    try:
+        symbols = get_symbols()
+        print("Total symbols:", len(symbols))
+    except Exception as e:
+        print("get_symbols error:", e)
+        return
 
-    symbols = get_symbols()
-
-    print("Total symbols:",len(symbols))
-
-    for s in symbols:
-
+    for symbol in symbols:
         try:
-
-            check_signal(s)
-
-        except:
-
-            pass
+            check_signal(symbol)
+        except Exception as e:
+            print(f"{symbol} signal error: {e}")
 
 
-send_telegram("🚀 Scanner aktif")
+if __name__ == "__main__":
+    send_telegram("🚀 Scanner aktif")
 
-while True:
+    while True:
+        try:
+            scan()
+        except Exception as e:
+            print("scan loop error:", e)
 
-    scan()
-
-    time.sleep(INTERVAL)
+        time.sleep(INTERVAL_SEC)
