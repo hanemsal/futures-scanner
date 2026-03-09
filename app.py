@@ -118,13 +118,13 @@ def check_signal(symbol):
     prev = df.iloc[-2]
 
     if pd.isna(last["ema123"]) or pd.isna(last["kama13"]) or pd.isna(prev["kama13"]) or pd.isna(last["macd"]) or pd.isna(last["vol_ma"]):
-        return
+        return False
 
     long_ok = (
         last["close"] > last["ema123"]
-        and last["kama13"] > prev["kama13"]   # KAMA13 slope yukarı
-        and last["macd"] >= 0                 # MACD 0 veya üstü
-        and last["volume"] >= last["vol_ma"]  # volume >= volume MA
+        and last["kama13"] > prev["kama13"]
+        and last["macd"] >= 0
+        and last["volume"] >= last["vol_ma"]
     )
 
     if long_ok:
@@ -140,6 +140,10 @@ def check_signal(symbol):
             f"• Volume ≥ Volume MA"
         )
         send_telegram(message)
+        print(f"SIGNAL: {symbol} @ {format_price(last['close'])}")
+        return True
+
+    return False
 
 
 def scan():
@@ -150,14 +154,21 @@ def scan():
         print("get_symbols error:", e)
         return
 
+    signal_count = 0
+
     for symbol in symbols:
         try:
-            check_signal(symbol)
+            ok = check_signal(symbol)
+            if ok:
+                signal_count += 1
         except Exception as e:
             print(f"{symbol} signal error: {e}")
 
+    print(f"Scan finished. Signals found: {signal_count}")
+
 
 if __name__ == "__main__":
+    print("Scanner started")
     send_telegram("🚀 Scanner aktif")
 
     while True:
