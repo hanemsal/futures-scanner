@@ -19,6 +19,7 @@ def q(sql, params=()):
 
 @app.route("/")
 def home():
+
     total_signals = q("SELECT COUNT(*) FROM signals")[0][0]
     total_exits = q("SELECT COUNT(*) FROM exits")[0][0]
 
@@ -26,155 +27,220 @@ def home():
     above_zero = q("SELECT COUNT(*) FROM signals WHERE signal_type='ABOVE_ZERO_LONG'")[0][0]
 
     valid_signals = q("SELECT COUNT(*) FROM signals WHERE status='VALID'")[0][0]
-    target_close = q("SELECT COUNT(*) FROM signals WHERE status='TARGET CLOSE'")[0][0]
 
-    avg_potential = q("SELECT COALESCE(AVG(potential_pct), 0) FROM signals")[0][0]
-    avg_profit = q("SELECT COALESCE(AVG(profit_pct), 0) FROM exits")[0][0]
+    avg_profit = q("SELECT COALESCE(AVG(profit_pct),0) FROM exits")[0][0]
+    total_pnl = q("SELECT COALESCE(SUM(profit_pct),0) FROM exits")[0][0]
+
+    win_rate = q("""
+    SELECT COALESCE(
+        100.0 * SUM(CASE WHEN profit_pct > 0 THEN 1 ELSE 0 END) /
+        NULLIF(COUNT(*),0),
+    0)
+    FROM exits
+    """)[0][0]
+
+    best_coin = q("""
+    SELECT symbol, AVG(profit_pct)
+    FROM exits
+    GROUP BY symbol
+    ORDER BY AVG(profit_pct) DESC
+    LIMIT 1
+    """)
+
+    worst_coin = q("""
+    SELECT symbol, AVG(profit_pct)
+    FROM exits
+    GROUP BY symbol
+    ORDER BY AVG(profit_pct) ASC
+    LIMIT 1
+    """)
+
+    best_coin = best_coin[0] if best_coin else ("-",0)
+    worst_coin = worst_coin[0] if worst_coin else ("-",0)
+
+    coin_ranking = q("""
+    SELECT symbol,
+    COUNT(*) as trades,
+    ROUND(AVG(profit_pct)::numeric,2)
+    FROM exits
+    GROUP BY symbol
+    ORDER BY AVG(profit_pct) DESC
+    LIMIT 15
+    """)
+
+    zone_stats = q("""
+    SELECT signal_type,
+    COUNT(*),
+    ROUND(AVG(profit_pct)::numeric,2)
+    FROM exits
+    GROUP BY signal_type
+    """)
+
+    daily_signals = q("""
+    SELECT DATE(created_at), COUNT(*)
+    FROM signals
+    GROUP BY DATE(created_at)
+    ORDER BY DATE(created_at)
+    LIMIT 30
+    """)
+
+    daily_exits = q("""
+    SELECT DATE(created_at), COUNT(*)
+    FROM exits
+    GROUP BY DATE(created_at)
+    ORDER BY DATE(created_at)
+    LIMIT 30
+    """)
 
     recent_signals = q("""
-        SELECT symbol, signal_type, entry, target, potential_pct, status, created_at
-        FROM signals
-        ORDER BY id DESC
-        LIMIT 30
+    SELECT symbol, signal_type, entry, target, potential_pct, status, created_at
+    FROM signals
+    ORDER BY id DESC
+    LIMIT 30
     """)
 
     recent_exits = q("""
-        SELECT symbol, entry, exit, target, profit_pct, created_at
-        FROM exits
-        ORDER BY id DESC
-        LIMIT 30
+    SELECT symbol, signal_type, entry, exit, target, profit_pct, created_at
+    FROM exits
+    ORDER BY id DESC
+    LIMIT 30
     """)
 
-    html = f"""
+    signal_labels=[str(r[0]) for r in daily_signals]
+    signal_vals=[int(r[1]) for r in daily_signals]
+
+    exit_labels=[str(r[0]) for r in daily_exits]
+    exit_vals=[int(r[1]) for r in daily_exits]
+
+    html=f"""
     <html>
     <head>
-        <title>Futures Scanner Dashboard</title>
-        <style>
-            body {{
-                font-family: Arial, sans-serif;
-                background: #0f1117;
-                color: #fff;
-                padding: 24px;
-            }}
-            .grid {{
-                display: grid;
-                grid-template-columns: repeat(4, 1fr);
-                gap: 16px;
-                margin-bottom: 24px;
-            }}
-            .card {{
-                background: #1a1f2b;
-                padding: 16px;
-                border-radius: 14px;
-                box-shadow: 0 0 10px rgba(0,0,0,0.25);
-            }}
-            h1, h2 {{
-                margin-top: 0;
-            }}
-            table {{
-                width: 100%;
-                border-collapse: collapse;
-                margin-top: 12px;
-                background: #1a1f2b;
-                border-radius: 12px;
-                overflow: hidden;
-            }}
-            th, td {{
-                padding: 10px;
-                border-bottom: 1px solid #2a3142;
-                text-align: left;
-                font-size: 14px;
-            }}
-            th {{
-                background: #232a3b;
-            }}
-            .section {{
-                margin-top: 28px;
-            }}
-            .green {{ color: #49d17d; }}
-            .yellow {{ color: #ffd166; }}
-            .blue {{ color: #67b7ff; }}
-        </style>
-    </head>
-    <body>
-        <h1>Futures Scanner Dashboard</h1>
 
-        <div class="grid">
-            <div class="card"><h2>{total_signals}</h2><div>Total Signals</div></div>
-            <div class="card"><h2>{total_exits}</h2><div>Total Exits</div></div>
-            <div class="card"><h2 class="green">{below_zero}</h2><div>Below Zero Long</div></div>
-            <div class="card"><h2 class="blue">{above_zero}</h2><div>Above Zero Long</div></div>
-            <div class="card"><h2>{valid_signals}</h2><div>VALID</div></div>
-            <div class="card"><h2 class="yellow">{target_close}</h2><div>TARGET CLOSE</div></div>
-            <div class="card"><h2>{round(float(avg_potential), 2)}%</h2><div>Avg Potential</div></div>
-            <div class="card"><h2>{round(float(avg_profit), 2)}%</h2><div>Avg Exit Profit</div></div>
-        </div>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 
-        <div class="section">
-            <h2>Recent Signals</h2>
-            <table>
-                <tr>
-                    <th>Symbol</th>
-                    <th>Type</th>
-                    <th>Entry</th>
-                    <th>Target</th>
-                    <th>Potential %</th>
-                    <th>Status</th>
-                    <th>Time</th>
-                </tr>
-    """
+<style>
 
-    for r in recent_signals:
-        html += f"""
-            <tr>
-                <td>{r[0]}</td>
-                <td>{r[1]}</td>
-                <td>{round(r[2], 8)}</td>
-                <td>{round(r[3], 8)}</td>
-                <td>{round(r[4], 2)}%</td>
-                <td>{r[5]}</td>
-                <td>{r[6]}</td>
-            </tr>
-        """
+body{{background:#0f1117;color:white;font-family:Arial;padding:24px}}
 
-    html += """
-            </table>
-        </div>
+.grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:15px}}
 
-        <div class="section">
-            <h2>Recent Exits</h2>
-            <table>
-                <tr>
-                    <th>Symbol</th>
-                    <th>Entry</th>
-                    <th>Exit</th>
-                    <th>Target</th>
-                    <th>Profit %</th>
-                    <th>Time</th>
-                </tr>
-    """
+.card{{background:#1a1f2b;padding:15px;border-radius:12px}}
 
-    for r in recent_exits:
-        html += f"""
-            <tr>
-                <td>{r[0]}</td>
-                <td>{round(r[1], 8)}</td>
-                <td>{round(r[2], 8)}</td>
-                <td>{round(r[3], 8)}</td>
-                <td>{round(r[4], 2)}%</td>
-                <td>{r[5]}</td>
-            </tr>
-        """
+table{{width:100%;border-collapse:collapse;margin-top:10px}}
 
-    html += """
-            </table>
-        </div>
-    </body>
-    </html>
-    """
+td,th{{padding:8px;border-bottom:1px solid #333}}
+
+</style>
+
+</head>
+
+<body>
+
+<h1>Futures Scanner Dashboard</h1>
+
+<div class="grid">
+
+<div class="card"><h2>{total_signals}</h2>Total Signals</div>
+<div class="card"><h2>{total_exits}</h2>Total Exits</div>
+<div class="card"><h2>{below_zero}</h2>Below Zero</div>
+<div class="card"><h2>{above_zero}</h2>Above Zero</div>
+
+<div class="card"><h2>{valid_signals}</h2>VALID</div>
+<div class="card"><h2>{round(win_rate,2)}%</h2>Win Rate</div>
+<div class="card"><h2>{round(total_pnl,2)}%</h2>Total PnL</div>
+<div class="card"><h2>{round(avg_profit,2)}%</h2>Avg Profit</div>
+
+</div>
+
+<h2>Best Coin</h2>
+{best_coin[0]} ({round(best_coin[1],2)}%)
+
+<h2>Worst Coin</h2>
+{worst_coin[0]} ({round(worst_coin[1],2)}%)
+
+<h2>Coin Ranking</h2>
+
+<table>
+
+<tr>
+<th>Coin</th>
+<th>Trades</th>
+<th>Avg Profit %</th>
+</tr>
+
+"""
+
+    for r in coin_ranking:
+
+        html+=f"""
+<tr>
+<td>{r[0]}</td>
+<td>{r[1]}</td>
+<td>{r[2]}%</td>
+</tr>
+"""
+
+    html+="""
+</table>
+"""
+
+    html+="""
+
+<h2>MACD Zone Performance</h2>
+
+<table>
+
+<tr>
+<th>Zone</th>
+<th>Trades</th>
+<th>Avg Profit</th>
+</tr>
+"""
+
+    for r in zone_stats:
+
+        html+=f"""
+<tr>
+<td>{r[0]}</td>
+<td>{r[1]}</td>
+<td>{r[2]}%</td>
+</tr>
+"""
+
+    html+="""
+</table>
+"""
+
+    html+=f"""
+
+<h2>Daily Signals</h2>
+<canvas id="signals"></canvas>
+
+<h2>Daily Exits</h2>
+<canvas id="exits"></canvas>
+
+<script>
+
+new Chart(document.getElementById('signals'),{{
+type:'bar',
+data:{{labels:{signal_labels},
+datasets:[{{label:'Signals',data:{signal_vals}}}]}}
+}})
+
+new Chart(document.getElementById('exits'),{{
+type:'line',
+data:{{labels:{exit_labels},
+datasets:[{{label:'Exits',data:{exit_vals}}}]}}
+}})
+
+</script>
+
+</body>
+</html>
+"""
 
     return html
 
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+if __name__=="__main__":
+    app.run(host="0.0.0.0",port=10000)
