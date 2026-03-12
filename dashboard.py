@@ -1,35 +1,35 @@
 import os
-import sqlite3
+import psycopg2
 from flask import Flask
 
-DB_FILE = os.getenv("DB_FILE", "signals.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 app = Flask(__name__)
 
 
 def q(sql, params=()):
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
+    conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
     cur.execute(sql, params)
     rows = cur.fetchall()
+    cur.close()
     conn.close()
     return rows
 
 
 @app.route("/")
 def home():
-    total_signals = q("SELECT COUNT(*) AS c FROM signals")[0]["c"]
-    total_exits = q("SELECT COUNT(*) AS c FROM exits")[0]["c"]
+    total_signals = q("SELECT COUNT(*) FROM signals")[0][0]
+    total_exits = q("SELECT COUNT(*) FROM exits")[0][0]
 
-    below_zero = q("SELECT COUNT(*) AS c FROM signals WHERE signal_type='BELOW_ZERO_LONG'")[0]["c"]
-    above_zero = q("SELECT COUNT(*) AS c FROM signals WHERE signal_type='ABOVE_ZERO_LONG'")[0]["c"]
+    below_zero = q("SELECT COUNT(*) FROM signals WHERE signal_type='BELOW_ZERO_LONG'")[0][0]
+    above_zero = q("SELECT COUNT(*) FROM signals WHERE signal_type='ABOVE_ZERO_LONG'")[0][0]
 
-    valid_signals = q("SELECT COUNT(*) AS c FROM signals WHERE status='VALID'")[0]["c"]
-    target_close = q("SELECT COUNT(*) AS c FROM signals WHERE status='TARGET CLOSE'")[0]["c"]
+    valid_signals = q("SELECT COUNT(*) FROM signals WHERE status='VALID'")[0][0]
+    target_close = q("SELECT COUNT(*) FROM signals WHERE status='TARGET CLOSE'")[0][0]
 
-    avg_potential = q("SELECT AVG(potential_pct) AS v FROM signals")[0]["v"]
-    avg_profit = q("SELECT AVG(profit_pct) AS v FROM exits")[0]["v"]
+    avg_potential = q("SELECT COALESCE(AVG(potential_pct), 0) FROM signals")[0][0]
+    avg_profit = q("SELECT COALESCE(AVG(profit_pct), 0) FROM exits")[0][0]
 
     recent_signals = q("""
         SELECT symbol, signal_type, entry, target, potential_pct, status, created_at
@@ -106,8 +106,8 @@ def home():
             <div class="card"><h2 class="blue">{above_zero}</h2><div>Above Zero Long</div></div>
             <div class="card"><h2>{valid_signals}</h2><div>VALID</div></div>
             <div class="card"><h2 class="yellow">{target_close}</h2><div>TARGET CLOSE</div></div>
-            <div class="card"><h2>{round(avg_potential or 0, 2)}%</h2><div>Avg Potential</div></div>
-            <div class="card"><h2>{round(avg_profit or 0, 2)}%</h2><div>Avg Exit Profit</div></div>
+            <div class="card"><h2>{round(float(avg_potential), 2)}%</h2><div>Avg Potential</div></div>
+            <div class="card"><h2>{round(float(avg_profit), 2)}%</h2><div>Avg Exit Profit</div></div>
         </div>
 
         <div class="section">
@@ -127,13 +127,13 @@ def home():
     for r in recent_signals:
         html += f"""
             <tr>
-                <td>{r['symbol']}</td>
-                <td>{r['signal_type']}</td>
-                <td>{round(r['entry'], 8)}</td>
-                <td>{round(r['target'], 8)}</td>
-                <td>{round(r['potential_pct'], 2)}%</td>
-                <td>{r['status']}</td>
-                <td>{r['created_at']}</td>
+                <td>{r[0]}</td>
+                <td>{r[1]}</td>
+                <td>{round(r[2], 8)}</td>
+                <td>{round(r[3], 8)}</td>
+                <td>{round(r[4], 2)}%</td>
+                <td>{r[5]}</td>
+                <td>{r[6]}</td>
             </tr>
         """
 
@@ -157,12 +157,12 @@ def home():
     for r in recent_exits:
         html += f"""
             <tr>
-                <td>{r['symbol']}</td>
-                <td>{round(r['entry'], 8)}</td>
-                <td>{round(r['exit'], 8)}</td>
-                <td>{round(r['target'], 8)}</td>
-                <td>{round(r['profit_pct'], 2)}%</td>
-                <td>{r['created_at']}</td>
+                <td>{r[0]}</td>
+                <td>{round(r[1], 8)}</td>
+                <td>{round(r[2], 8)}</td>
+                <td>{round(r[3], 8)}</td>
+                <td>{round(r[4], 2)}%</td>
+                <td>{r[5]}</td>
             </tr>
         """
 
