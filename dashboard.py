@@ -1,5 +1,5 @@
 import os
-import psycopg2
+import psycopg
 from flask import Flask
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
