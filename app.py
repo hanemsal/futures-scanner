@@ -6,7 +6,7 @@ from datetime import datetime, UTC
 from typing import Dict, List, Optional, Tuple
 
 import requests
-import psycopg2
+import psycopg
 
 BINANCE_FAPI_BASE = "https://fapi.binance.com"
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
