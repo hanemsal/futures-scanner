@@ -8,7 +8,7 @@ app = Flask(__name__)
 
 
 def q(sql, params=()):
-    conn = psycopg2.connect(DATABASE_URL)
+    conn = psycopg.connect(DATABASE_URL)
     cur = conn.cursor()
     cur.execute(sql, params)
     rows = cur.fetchall()
