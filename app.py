@@ -1,7 +1,7 @@
 import os
 import json
 import time
-import math
+import sqlite3
 import logging
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
@@ -10,13 +10,13 @@ import requests
 
 BINANCE_FAPI_BASE = "https://fapi.binance.com"
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
+DB_FILE = os.getenv("DB_FILE", "signals.db")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "20"))
-EXIT_CHECK_SECONDS = int(os.getenv("EXIT_CHECK_SECONDS", "60"))
-TARGET_CLOSE_PCT = float(os.getenv("TARGET_CLOSE_PCT", "3.0"))  # hedef %3 ve altıysa yakın say
+TARGET_CLOSE_PCT = float(os.getenv("TARGET_CLOSE_PCT", "3.0"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "15"))
 
 MACD_FAST = 47
@@ -32,12 +32,58 @@ logging.basicConfig(
 session = requests.Session()
 
 
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS signals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT,
+        signal_type TEXT,
+        entry REAL,
+        target REAL,
+        potential_pct REAL,
+        status TEXT,
+        macd_value REAL,
+        signal_value REAL,
+        candle_close_time_ms INTEGER,
+        created_at TEXT
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS exits (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT,
+        entry REAL,
+        exit REAL,
+        target REAL,
+        profit_pct REAL,
+        entry_time_ms INTEGER,
+        exit_time_ms INTEGER,
+        created_at TEXT
+    )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def db_execute(query: str, params: tuple = ()):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute(query, params)
+    conn.commit()
+    conn.close()
+
+
 def load_state() -> dict:
     if not os.path.exists(STATE_FILE):
         return {
             "last_scanned_15m_close": None,
-            "open_positions": {},     # symbol -> {entry, target, entry_time, status}
-            "sent_entries": {}        # symbol -> last entry candle close time
+            "open_positions": {},
+            "sent_entries": {}
         }
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
@@ -78,7 +124,7 @@ def send_telegram(text: str) -> None:
         logging.exception("Telegram mesajı gönderilemedi.")
 
 
-def http_get_json(url: str, params: Optional[dict] = None) -> dict:
+def http_get_json(url: str, params: Optional[dict] = None):
     resp = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
     resp.raise_for_status()
     return resp.json()
@@ -119,7 +165,7 @@ def to_closes(klines: List[list]) -> List[float]:
     return [float(k[4]) for k in klines]
 
 
-def ema(values: List[float], length: int) -> List[float]:
+def ema(values: List[float], length: int) -> List[Optional[float]]:
     if len(values) < length:
         return []
 
@@ -138,13 +184,18 @@ def ema(values: List[float], length: int) -> List[float]:
     return result
 
 
-def macd_series(closes: List[float], fast: int, slow: int, signal_len: int) -> Tuple[List[Optional[float]], List[Optional[float]]]:
+def macd_series(closes: List[float], fast: int, slow: int, signal_len: int):
     ema_fast = ema(closes, fast)
     ema_slow = ema(closes, slow)
 
     macd = [None] * len(closes)
     for i in range(len(closes)):
-        if i < len(ema_fast) and i < len(ema_slow) and ema_fast[i] is not None and ema_slow[i] is not None:
+        if (
+            i < len(ema_fast)
+            and i < len(ema_slow)
+            and ema_fast[i] is not None
+            and ema_slow[i] is not None
+        ):
             macd[i] = ema_fast[i] - ema_slow[i]
 
     macd_vals_only = [x for x in macd if x is not None]
@@ -161,28 +212,25 @@ def macd_series(closes: List[float], fast: int, slow: int, signal_len: int) -> T
     return macd, signal
 
 
-def bullish_macd_cross_below_zero(closes: List[float]) -> Tuple[bool, Optional[float], Optional[float]]:
-    """
-    Kural:
-    - MACD(fast=47, slow=123, signal=9)
-    - son kapanmış mumda bullish cross
-    - macd line < 0
-    """
+def bullish_macd_cross(closes: List[float]):
     macd, signal = macd_series(closes, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
 
     if len(closes) < max(MACD_FAST, MACD_SLOW) + MACD_SIGNAL + 5:
-        return False, None, None
+        return False, None, None, None
 
     i = len(closes) - 1
     prev_i = i - 1
 
     if any(x is None for x in [macd[prev_i], signal[prev_i], macd[i], signal[i]]):
-        return False, None, None
+        return False, None, None, None
 
     crossed_up = macd[prev_i] <= signal[prev_i] and macd[i] > signal[i]
-    below_zero = macd[i] < 0
 
-    return crossed_up and below_zero, macd[i], signal[i]
+    if not crossed_up:
+        return False, macd[i], signal[i], None
+
+    zone = "BELOW_ZERO_LONG" if macd[i] < 0 else "ABOVE_ZERO_LONG"
+    return True, macd[i], signal[i], zone
 
 
 def get_daily_ema47(symbol: str) -> Optional[float]:
@@ -212,18 +260,10 @@ def format_pct(pct: float) -> str:
     return f"{pct:.2f}"
 
 
-def ms_to_iso(ms: int) -> str:
-    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-
-
 def get_last_closed_15m_candle_time_ms() -> int:
-    """
-    Son TAMAMLANMIŞ 15dk mum kapanış zamanı.
-    """
     now = int(time.time())
-    bucket = now - (now % 900)   # içinde bulunulan 15dk başlangıcı
-    last_close = bucket          # şu an kapanan / kapanmış son mumun close time
-    return last_close * 1000
+    bucket = now - (now % 900)
+    return bucket * 1000
 
 
 def scan_entries(state: dict, symbols: List[str]) -> None:
@@ -237,21 +277,19 @@ def scan_entries(state: dict, symbols: List[str]) -> None:
             if len(klines) < 150:
                 continue
 
-            # Binance son kline çoğu zaman açık mum olabilir.
-            # Bu yüzden son kapanmış mumu almak için sondan 2'yi kullanıyoruz.
             closed_klines = klines[:-1]
             closes = to_closes(closed_klines)
-            signal_ok, macd_val, signal_val = bullish_macd_cross_below_zero(closes)
+
+            signal_ok, macd_val, signal_val, zone = bullish_macd_cross(closes)
             scanned += 1
 
             if not signal_ok:
                 continue
 
             last_closed = closed_klines[-1]
-            candle_close_time_ms = int(last_closed[6])  # kline close time
+            candle_close_time_ms = int(last_closed[6])
             entry_price = float(last_closed[4])
 
-            # Aynı mum için tekrar sinyal atma
             last_sent = state["sent_entries"].get(symbol)
             if last_sent == candle_close_time_ms:
                 continue
@@ -261,11 +299,18 @@ def scan_entries(state: dict, symbols: List[str]) -> None:
                 continue
 
             potential_pct = ((daily_target - entry_price) / entry_price) * 100
-            status = "VALID" if potential_pct > TARGET_CLOSE_PCT else "TARGET CLOSE"
+
+            if daily_target <= entry_price:
+                status = "TARGET CLOSE"
+            elif potential_pct <= TARGET_CLOSE_PCT:
+                status = "TARGET CLOSE"
+            else:
+                status = "VALID"
 
             text = (
                 f"<b>COIN:</b> {symbol}\n"
-                f"<b>SIGNAL:</b> LONG\n\n"
+                f"<b>SIGNAL:</b> LONG\n"
+                f"<b>ZONE:</b> {zone}\n\n"
                 f"<b>ENTRY:</b> {format_price(entry_price)}\n"
                 f"<b>TARGET:</b> {format_price(daily_target)} (Daily EMA47)\n\n"
                 f"<b>POTENTIAL:</b> %{format_pct(potential_pct)}\n\n"
@@ -277,14 +322,30 @@ def scan_entries(state: dict, symbols: List[str]) -> None:
 
             send_telegram(text)
 
+            db_execute("""
+                INSERT INTO signals
+                (symbol, signal_type, entry, target, potential_pct, status, macd_value, signal_value, candle_close_time_ms, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                symbol,
+                zone,
+                entry_price,
+                daily_target,
+                potential_pct,
+                status,
+                macd_val,
+                signal_val,
+                candle_close_time_ms,
+                datetime.utcnow().isoformat()
+            ))
+
             state["sent_entries"][symbol] = candle_close_time_ms
             state["open_positions"][symbol] = {
                 "entry": entry_price,
                 "target": daily_target,
                 "entry_time": candle_close_time_ms,
                 "status": status,
-                "macd": macd_val,
-                "signal": signal_val
+                "signal_type": zone
             }
             signaled += 1
 
@@ -319,6 +380,11 @@ def check_exits(state: dict) -> None:
             target = float(pos["target"])
             entry = float(pos["entry"])
 
+            # kritik düzeltme:
+            # target entry altında ise exit kontrolü YAPMA
+            if target <= entry:
+                continue
+
             if current_price >= target:
                 profit_pct = ((current_price - entry) / entry) * 100
 
@@ -330,6 +396,22 @@ def check_exits(state: dict) -> None:
                     f"<b>PROFIT:</b> %{format_pct(profit_pct)}"
                 )
                 send_telegram(text)
+
+                db_execute("""
+                    INSERT INTO exits
+                    (symbol, entry, exit, target, profit_pct, entry_time_ms, exit_time_ms, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    symbol,
+                    entry,
+                    current_price,
+                    target,
+                    profit_pct,
+                    int(pos["entry_time"]),
+                    int(time.time() * 1000),
+                    datetime.utcnow().isoformat()
+                ))
+
                 to_remove.append(symbol)
 
         except Exception:
@@ -340,8 +422,7 @@ def check_exits(state: dict) -> None:
 
 
 def main() -> None:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logging.warning("TELEGRAM_BOT_TOKEN veya TELEGRAM_CHAT_ID eksik.")
+    init_db()
 
     send_telegram("Worker started: MACD47/123 + Daily EMA47 scanner aktif.")
 
@@ -354,12 +435,10 @@ def main() -> None:
             last_closed_15m = get_last_closed_15m_candle_time_ms()
 
             if state.get("last_scanned_15m_close") != last_closed_15m:
-                # yeni 15dk kapanışı geldiyse entry scan çalıştır
                 scan_entries(state, symbols)
                 state["last_scanned_15m_close"] = last_closed_15m
                 save_state(state)
 
-            # exit kontrolleri
             check_exits(state)
             save_state(state)
 
