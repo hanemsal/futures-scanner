@@ -1,4 +1,1 @@
-requests
-pandas
-numpy
-ta
+requests==2.32.3
