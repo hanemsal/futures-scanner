@@ -35,7 +35,7 @@ session = requests.Session()
 def get_conn():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL env eksik.")
-    return psycopg2.connect(DATABASE_URL)
+    return psycopg.connect(DATABASE_URL)
 
 
 def init_db():
