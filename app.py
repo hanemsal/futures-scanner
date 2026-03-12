@@ -1,16 +1,16 @@
 import os
 import json
 import time
-import sqlite3
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from typing import Dict, List, Optional, Tuple
 
 import requests
+import psycopg2
 
 BINANCE_FAPI_BASE = "https://fapi.binance.com"
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
-DB_FILE = os.getenv("DB_FILE", "signals.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -32,49 +32,111 @@ logging.basicConfig(
 session = requests.Session()
 
 
+def get_conn():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL env eksik.")
+    return psycopg2.connect(DATABASE_URL)
+
+
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_conn()
     cur = conn.cursor()
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS signals (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        symbol TEXT,
-        signal_type TEXT,
-        entry REAL,
-        target REAL,
-        potential_pct REAL,
-        status TEXT,
-        macd_value REAL,
-        signal_value REAL,
-        candle_close_time_ms INTEGER,
-        created_at TEXT
-    )
+        id SERIAL PRIMARY KEY,
+        symbol TEXT NOT NULL,
+        signal_type TEXT NOT NULL,
+        entry DOUBLE PRECISION NOT NULL,
+        target DOUBLE PRECISION NOT NULL,
+        potential_pct DOUBLE PRECISION NOT NULL,
+        status TEXT NOT NULL,
+        macd_value DOUBLE PRECISION,
+        signal_value DOUBLE PRECISION,
+        candle_close_time_ms BIGINT NOT NULL,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
     """)
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS exits (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        symbol TEXT,
-        entry REAL,
-        exit REAL,
-        target REAL,
-        profit_pct REAL,
-        entry_time_ms INTEGER,
-        exit_time_ms INTEGER,
-        created_at TEXT
-    )
+        id SERIAL PRIMARY KEY,
+        symbol TEXT NOT NULL,
+        entry DOUBLE PRECISION NOT NULL,
+        exit DOUBLE PRECISION NOT NULL,
+        target DOUBLE PRECISION NOT NULL,
+        profit_pct DOUBLE PRECISION NOT NULL,
+        entry_time_ms BIGINT,
+        exit_time_ms BIGINT NOT NULL,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
     """)
 
     conn.commit()
+    cur.close()
+    conn.close()
+    logging.info("Postgres tabloları hazır.")
+
+
+def insert_signal(
+    symbol: str,
+    signal_type: str,
+    entry: float,
+    target: float,
+    potential_pct: float,
+    status: str,
+    macd_value: Optional[float],
+    signal_value: Optional[float],
+    candle_close_time_ms: int,
+):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO signals
+        (symbol, signal_type, entry, target, potential_pct, status, macd_value, signal_value, candle_close_time_ms)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """, (
+        symbol,
+        signal_type,
+        entry,
+        target,
+        potential_pct,
+        status,
+        macd_value,
+        signal_value,
+        candle_close_time_ms
+    ))
+    conn.commit()
+    cur.close()
     conn.close()
 
 
-def db_execute(query: str, params: tuple = ()):
-    conn = sqlite3.connect(DB_FILE)
+def insert_exit(
+    symbol: str,
+    entry: float,
+    exit_price: float,
+    target: float,
+    profit_pct: float,
+    entry_time_ms: Optional[int],
+    exit_time_ms: int,
+):
+    conn = get_conn()
     cur = conn.cursor()
-    cur.execute(query, params)
+    cur.execute("""
+        INSERT INTO exits
+        (symbol, entry, exit, target, profit_pct, entry_time_ms, exit_time_ms)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+    """, (
+        symbol,
+        entry,
+        exit_price,
+        target,
+        profit_pct,
+        entry_time_ms,
+        exit_time_ms
+    ))
     conn.commit()
+    cur.close()
     conn.close()
 
 
@@ -170,7 +232,7 @@ def ema(values: List[float], length: int) -> List[Optional[float]]:
         return []
 
     alpha = 2 / (length + 1)
-    result = [None] * len(values)
+    result: List[Optional[float]] = [None] * len(values)
 
     sma = sum(values[:length]) / length
     result[length - 1] = sma
@@ -188,7 +250,7 @@ def macd_series(closes: List[float], fast: int, slow: int, signal_len: int):
     ema_fast = ema(closes, fast)
     ema_slow = ema(closes, slow)
 
-    macd = [None] * len(closes)
+    macd: List[Optional[float]] = [None] * len(closes)
     for i in range(len(closes)):
         if (
             i < len(ema_fast)
@@ -201,7 +263,7 @@ def macd_series(closes: List[float], fast: int, slow: int, signal_len: int):
     macd_vals_only = [x for x in macd if x is not None]
     signal_raw = ema(macd_vals_only, signal_len)
 
-    signal = [None] * len(closes)
+    signal: List[Optional[float]] = [None] * len(closes)
     sig_idx = 0
     for i in range(len(closes)):
         if macd[i] is not None:
@@ -322,22 +384,17 @@ def scan_entries(state: dict, symbols: List[str]) -> None:
 
             send_telegram(text)
 
-            db_execute("""
-                INSERT INTO signals
-                (symbol, signal_type, entry, target, potential_pct, status, macd_value, signal_value, candle_close_time_ms, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                symbol,
-                zone,
-                entry_price,
-                daily_target,
-                potential_pct,
-                status,
-                macd_val,
-                signal_val,
-                candle_close_time_ms,
-                datetime.utcnow().isoformat()
-            ))
+            insert_signal(
+                symbol=symbol,
+                signal_type=zone,
+                entry=entry_price,
+                target=daily_target,
+                potential_pct=potential_pct,
+                status=status,
+                macd_value=macd_val,
+                signal_value=signal_val,
+                candle_close_time_ms=candle_close_time_ms,
+            )
 
             state["sent_entries"][symbol] = candle_close_time_ms
             state["open_positions"][symbol] = {
@@ -380,8 +437,6 @@ def check_exits(state: dict) -> None:
             target = float(pos["target"])
             entry = float(pos["entry"])
 
-            # kritik düzeltme:
-            # target entry altında ise exit kontrolü YAPMA
             if target <= entry:
                 continue
 
@@ -397,20 +452,15 @@ def check_exits(state: dict) -> None:
                 )
                 send_telegram(text)
 
-                db_execute("""
-                    INSERT INTO exits
-                    (symbol, entry, exit, target, profit_pct, entry_time_ms, exit_time_ms, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    symbol,
-                    entry,
-                    current_price,
-                    target,
-                    profit_pct,
-                    int(pos["entry_time"]),
-                    int(time.time() * 1000),
-                    datetime.utcnow().isoformat()
-                ))
+                insert_exit(
+                    symbol=symbol,
+                    entry=entry,
+                    exit_price=current_price,
+                    target=target,
+                    profit_pct=profit_pct,
+                    entry_time_ms=pos.get("entry_time"),
+                    exit_time_ms=int(time.time() * 1000),
+                )
 
                 to_remove.append(symbol)
 
